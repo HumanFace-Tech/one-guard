@@ -1,6 +1,6 @@
 # One Guard internal reference
 
-This file records implementation contracts for maintainers and code agents. The user-facing installation and configuration guide is [README.md](README.md). Do not treat model judgment as a sandbox boundary.
+This file records implementation contracts for maintainers and code agents. The user-facing installation and configuration guide is [README.md](README.md), with the details in [docs/installation.md](docs/installation.md), [docs/configuration.md](docs/configuration.md), and [docs/threat-model.md](docs/threat-model.md). Do not treat model judgment as a sandbox boundary.
 
 ## Source baseline
 

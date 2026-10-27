@@ -1,6 +1,6 @@
 # Architecture decision records
 
-These records capture the current One Guard design. Implementation details are documented in the [root README](../../README.md), and upstream evidence is in [research notes](../research.md).
+These records capture the current One Guard design. Implementation details are documented in the [root README](../../README.md) and the [docs](../) pages, and upstream evidence is in [research notes](../research.md).
 
 | ADR | Decision |
 | --- | --- |
