@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.pytest_cache/
+.test-artifacts/
+dist/
+build/
+*.egg-info/
+.one-guard-install.lock
+.one-guard-backup-*/
+.one-guard-stage-*/
