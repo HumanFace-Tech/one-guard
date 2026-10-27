@@ -1,5 +1,6 @@
 import argparse
 import copy
+import contextlib
 import hashlib
 import importlib.util
 import ipaddress
@@ -30,6 +31,7 @@ def _load_sibling(name):
 
 
 installer_ui = _load_sibling("installer_ui")
+installer_bootstrap = _load_sibling("installer_bootstrap")
 
 
 class InstallError(ValueError):
@@ -142,6 +144,8 @@ def load_yaml_module(source, argv, prefer_ui=False):
     python = source / ".venv/bin/python"
     if not os.environ.get("ONE_GUARD_INSTALL_REEXEC") and python.is_file():
         probe = subprocess.run([str(python), "-c", probe_imports], capture_output=True)
+        if probe.returncode and yaml is None and prefer_ui:
+            probe = subprocess.run([str(python), "-c", "import yaml, dotenv"], capture_output=True)
         if probe.returncode == 0:
             env = dict(os.environ, ONE_GUARD_INSTALL_REEXEC="1")
             os.execve(str(python), [str(python), str(Path(__file__).resolve()), *argv,
@@ -485,7 +489,10 @@ def apply_install(home, files, config_bytes, env_bytes):
 def validate_source(value):
     if not value.strip():
         raise InstallError("Enter an existing Hermes source directory.")
-    source = safe_path(Path(value))
+    try:
+        source = safe_path(Path(value))
+    except InstallError as exc:
+        raise InstallError(f"{exc}. Enter the canonical checkout path manually: {Path(value).expanduser().resolve()}") from exc
     if not is_source(source):
         raise InstallError("Expected a Hermes checkout containing hermes_cli and hermes or pyproject.toml.")
     return source
@@ -580,7 +587,7 @@ def configure_judge(ui, args, settings):
                                     insecure_override=args.insecure_override, model=value))
         return value
 
-    ui.say("Leave the model blank when your endpoint selects one by itself.")
+    ui.say("Leave the model blank when your endpoint selects one by itself; multi-model routers usually need a model identifier.")
     args.model = ui.text("Judge model", model_default, validate=model)
     ui.header("04 / Decision policy",
               "Uncertain, malformed, or unreachable judgments block the tool call.")
@@ -588,6 +595,8 @@ def configure_judge(ui, args, settings):
                                    [("yes_no", "Yes / no verdict  ·  simplest to reason about"),
                                     ("probability", "Risk probability  ·  needs a threshold")],
                                    1 if defaults["mode"] == "probability" else 0)
+    if args.protocol == "systemone":
+        ui.say("System One can respond slowly; allow enough time for your judge and Hermes host timeout.")
     args.timeout = ui.text("Timeout in seconds", defaults["timeout"],
                            validate=lambda value: number_field(value, 0.01, 120))
     if args.response_mode == "probability":
@@ -653,7 +662,7 @@ def run_wizard(ui, args, source, yaml):
                                  ("judge", "Change the judge settings"),
                                  ("home", "Change the destination")])
             if section == "cancel":
-                raise Cancelled("Installation cancelled. No files were written.")
+                raise Cancelled("Installation cancelled. No Hermes files were written.")
             continue
         config = parse_config(serialized, yaml)
         effective = config["plugins"]["entries"][PLUGIN]["settings"]
@@ -689,7 +698,7 @@ def run_wizard(ui, args, source, yaml):
                             ("edit", "Change something first"),
                             ("cancel", "Cancel — write nothing")])
         if action == "cancel":
-            raise Cancelled("Installation cancelled. No files were written.")
+            raise Cancelled("Installation cancelled. No Hermes files were written.")
         if action == "install":
             return source, home, token, clear_token
         section = ui.choose("Change what?",
@@ -703,7 +712,7 @@ def run_wizard(ui, args, source, yaml):
 def parser():
     result = argparse.ArgumentParser(
         description="Install the local one-guard native plugin into a selected Hermes data home. Existing YAML data is preserved; formatting and comments may change. Stop Hermes while installing.",
-        epilog="The bearer token comes from ONE_GUARD_TOKEN or an interactive hidden prompt and is saved in Hermes .env (mode 0600). With --yes and no token environment variable, the existing token is preserved or migrated from config.yaml. Defaults: http://127.0.0.1:8080/v1/chat/completions, yes_no mode. No packages or models are downloaded.",
+        epilog="The bearer token comes from ONE_GUARD_TOKEN or an interactive hidden prompt and is saved in Hermes .env (mode 0600). With --yes and no token environment variable, the existing token is preserved or migrated from config.yaml. Defaults: http://127.0.0.1:8080/v1/chat/completions, yes_no mode. The optional terminal UI can be downloaded with consent.",
     )
     result.add_argument("--hermes-dir", help="Hermes source checkout (not its data home)")
     result.add_argument("--hermes-home", help="Hermes data home (default: HERMES_HOME or ~/.hermes)")
@@ -722,6 +731,11 @@ def parser():
 
 
 def main(argv=None):
+    with contextlib.ExitStack() as stack:
+        return _main(argv, stack)
+
+
+def _main(argv, stack):
     argv = sys.argv[1:] if argv is None else argv
     args = parser().parse_args(argv)
     ui = None
@@ -739,6 +753,20 @@ def main(argv=None):
             ui.header("ONE GUARD", "A native Hermes tool guard · Configure, review, then install · Ctrl-C cancels")
             source = select_source(args.hermes_dir, ui=ui)
             yaml = load_yaml_module(source, argv, prefer_ui=installer_ui.wants_rich(args))
+            if installer_ui.wants_rich(args) and not installer_ui.rich_available():
+                choice = ui.choose("Optional enhanced terminal UI: download pinned packages into a temporary private environment?",
+                                   [(False, "No, continue with plain setup"),
+                                    (True, "Yes, download the optional terminal UI")])
+                if choice:
+                    try:
+                        with contextlib.ExitStack() as provision:
+                            provision.enter_context(installer_bootstrap.provision())
+                            if not installer_ui.rich_available():
+                                raise ImportError("Optional UI unavailable")
+                            ui = installer_ui.create_ui(args)
+                            stack.enter_context(provision.pop_all())
+                    except (OSError, ValueError, ImportError, subprocess.SubprocessError):
+                        ui.say("Optional UI unavailable; continuing with plain setup.")
             source, home, token, clear_token = run_wizard(ui, args, source, yaml)
         for directory in (home, home / "plugins"):
             safe_path(directory)
@@ -779,13 +807,13 @@ def main(argv=None):
         print("Error: " + (ui.clean(message) if ui else installer_ui.safe_text(message)), file=sys.stderr)
         return 1
     except (ValueError, OSError, EOFError) as exc:
-        message = "Input ended before installation was confirmed." if isinstance(exc, EOFError) else str(exc)
+        message = "Input ended before installation was confirmed. No Hermes files were written." if isinstance(exc, EOFError) else str(exc)
         if isinstance(token, str) and token:
             message = message.replace(token, "[credential]")
         print("Error: " + (ui.clean(message) if ui else installer_ui.safe_text(message)), file=sys.stderr)
         return 1
     except KeyboardInterrupt:
-        print("Error: Installation interrupted. No files were written.", file=sys.stderr)
+        print("Error: Installation interrupted. No Hermes files were written.", file=sys.stderr)
         return 1
 
 

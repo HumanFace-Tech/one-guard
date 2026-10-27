@@ -10,7 +10,7 @@ cd one-guard
 sh ./install.sh
 ```
 
-That's it. The installer opens a small wizard, asks a handful of questions, shows you what it's about to do, and writes nothing until you confirm. Stop Hermes first, restart it after.
+That's it. The installer opens a small wizard, asks a handful of questions, shows you what it's about to do, and writes nothing until you confirm. On an interactive color terminal, it can ask permission to download pinned packages for arrow-key menus into a temporary isolated environment. Say no, or use the plain wizard, to avoid that download. Stop Hermes first, restart it after.
 
 ## What It Actually Does
 
@@ -100,10 +100,10 @@ There's a second one built from a published agent-incident trace, if you want to
 
 -   Python 3.10+ and a POSIX shell
 -   Hermes, obviously
--   PyYAML and python-dotenv in the active Python or in Hermes' `.venv` - the installer will tell you if they're missing, and it never installs anything itself
--   `prompt_toolkit` if you want the pretty arrow-key menus. Without it you get a numbered wizard that works just as well
+-   PyYAML and python-dotenv in the active Python or in Hermes' `.venv` - these must already be installed; the installer does not install them
+-   For the optional arrow-key menus, either `prompt_toolkit` already available or your consent to download pinned UI packages into a temporary isolated environment. Without consent or when the UI is unavailable, the numbered wizard works without those packages
 
-The plugin runtime is pure standard library - no runtime dependencies, no model downloads, no inference server. The installer needs PyYAML and python-dotenv from the active Python or Hermes' `.venv`, and it never installs anything itself.
+The plugin runtime is pure standard library - no runtime dependencies, no model downloads, no inference server. The optional UI download is only for the installer's terminal menus: its temporary environment is removed on exit and it does not modify Hermes or system Python. The installer still requires PyYAML and python-dotenv to pre-exist in the active Python or Hermes' `.venv`.
 
 ## Development
 

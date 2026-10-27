@@ -15,7 +15,7 @@ ANSI = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
 
 
 class Terminal:
-    def __init__(self, root, source, release):
+    def __init__(self, root, source, release, bootstrap=False):
         self.root = root
         environment = dict(os.environ)
         environment.update({"HOME": str(root), "HERMES_HOME": str(root / "data"),
@@ -23,11 +23,21 @@ class Terminal:
                             "TERM": "xterm-256color"})
         environment.pop("ONE_GUARD_TOKEN", None)
         script = root / "run.py"
+        stub = ("import contextlib\n"
+                "available = m.installer_ui.rich_available\n"
+                "state = [False]\n"
+                "m.installer_ui.rich_available = lambda: state[0] and available()\n"
+                "@contextlib.contextmanager\n"
+                "def provision():\n"
+                "    state[0] = True\n"
+                "    yield True\n"
+                "m.installer_bootstrap.provision = provision\n") if bootstrap else ""
         script.write_text(
             "import importlib.util, sys, pathlib\n"
             f"spec = importlib.util.spec_from_file_location('i', {str(ROOT / 'scripts/install.py')!r})\n"
             "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
             f"m.RELEASE = pathlib.Path({str(release)!r})\n"
+            + stub +
             f"sys.exit(m.main(['--hermes-dir', {str(source)!r}]))\n")
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
@@ -110,6 +120,27 @@ class TerminalWizardTests(unittest.TestCase):
         self.assertEqual(settings["judge_model"], "h2o-lightning-4b")
         self.assertEqual(settings["timeout"], 60)
         self.assertTrue(settings["allow_insecure_http"])
+
+    def test_consent_bootstrap_then_arrow_wizard(self):
+        terminal = Terminal(self.root, self.source, self.release, bootstrap=True)
+        self.addCleanup(terminal.close)
+        terminal.pump(2.5)
+        self.assertIn("download pinned packages", terminal.transcript)
+        self.assertFalse((self.root / "data").exists())
+        terminal.send(b"2\r", 1.5)
+        terminal.send(b"\r", 1.2)
+        terminal.send(b"\x1b[B", 0.7)
+        terminal.send(b"\r", 1.0)
+        terminal.send(b"\r", 1.0)
+        terminal.send(b"\r", 1.2)
+        terminal.send(b"\r", 1.2)
+        terminal.send(b"\r", 1.2)
+        terminal.send(b"\r", 1.2)
+        terminal.send(b"\r", 1.2)
+        terminal.send(b"\r", 2.5)
+        import yaml
+        settings = yaml.safe_load((self.root / "data/config.yaml").read_text())["plugins"]["entries"]["one-guard"]["settings"]
+        self.assertEqual(settings["protocol"], "systemone")
 
     def test_review_screen_shows_effective_settings(self):
         terminal = self.start()

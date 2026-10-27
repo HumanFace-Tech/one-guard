@@ -22,13 +22,13 @@ def rich_available():
 
 
 def wants_rich(args):
-    if getattr(args, "plain", False):
+    if getattr(args, "plain", False) or getattr(args, "yes", False):
         return False
     if os.environ.get("TERM", "dumb") == "dumb":
         return False
     if "NO_COLOR" in os.environ:
         return False
-    return rich_available()
+    return sys.stdin.isatty() and sys.stdout.isatty()
 
 
 class PlainUI:
@@ -127,7 +127,7 @@ class ToolkitUI(PlainUI):
 
     def header(self, title, description=""):
         fragments = [("class:border", BORDER * 64 + "\n"),
-                     ("class:title", self.clean(title) + "\n")]
+                     ("class:title", "◆ " + self.clean(title) + "\n")]
         if description:
             fragments.append(("class:hint", self.clean(description) + "\n"))
         fragments.append(("class:border", BORDER * 64))
@@ -265,7 +265,7 @@ class ToolkitUI(PlainUI):
 def create_ui(args):
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         raise ValueError("The interactive setup needs a terminal. Use --hermes-dir and --yes for automation.")
-    if wants_rich(args):
+    if wants_rich(args) and rich_available():
         return ToolkitUI()
     ui = PlainUI()
     ui.say("Plain setup · numbered choices · Enter keeps defaults · Ctrl-C cancels")

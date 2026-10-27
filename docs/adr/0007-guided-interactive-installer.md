@@ -16,8 +16,9 @@ Two constraints shaped the design:
 
 - The plugin runtime must stay dependency-free. It is installed into a Hermes
   home and loaded by Hermes' own Python.
-- The installer must never install packages on the user's behalf, and must never
-  reach the network during setup.
+- The installer must not silently install packages or reach the network during
+  setup. Any optional network activity needs explicit consent and must not alter
+  Hermes or the system Python environment.
 
 The existing `--yes` flag path also had to keep working exactly as before, for
 automation and for CI.
@@ -39,16 +40,23 @@ Two rendering backends sit behind one interface:
 - `PlainUI` is a numbered, always-available fallback with no third-party
   dependency.
 
-`prompt_toolkit` is an optional dependency (`[project.optional-dependencies]
-installer-ui`). The installer probes for it and falls back; it never runs pip.
+`prompt_toolkit` is optional. If it is already importable, the wizard can use it
+directly. Otherwise, in an eligible interactive terminal, the installer asks
+before using pip to install the hash-pinned UI requirements into a temporary,
+isolated virtual environment. The environment and its imports are removed when
+the installer exits. Declining or failing to provision falls back to `PlainUI`.
+The bootstrap is only for terminal rendering; PyYAML and python-dotenv must
+already be available in the active Python or Hermes `.venv`.
 
 ## Consequences
 
 - The wizard validates through the same `merge_config` code as the CLI, so an
   interactive install cannot accept a setting the flag path would reject. The
   wizard never re-implements a rule.
-- Nothing is written before confirmation. Cancel, Ctrl-C, and EOF raise before
-  any directory, lock file, stage directory, or backup is created.
+- No Hermes files are written before confirmation. If the user consents to the
+  optional UI bootstrap, it creates a disposable temporary environment before
+  the review; cancel, Ctrl-C, and EOF still leave the Hermes target untouched,
+  and the temporary environment is removed on exit.
 - The credential is entered through a masked field, is excluded from prompt
   history, is replaced with `[credential]` on every output path, and never
   reaches `config.yaml`.
@@ -56,6 +64,12 @@ installer-ui`). The installer probes for it and falls back; it never runs pip.
   endpoint cannot emit ANSI escapes into the user's terminal.
 - The installer is now more complex, and `scripts/installer_ui.py` must stay a
   sibling of `scripts/install.py` because it is loaded by path.
+- The optional UI bootstrap reaches PyPI only after explicit consent. It does
+  not install Hermes, system packages, plugin runtime dependencies, a model, or
+  an inference server. `--yes`, `--plain`, `NO_COLOR`, and `TERM=dumb` skip the
+  bootstrap offer. The initial source selector uses the enhanced UI when the
+  toolkit is already available; otherwise it is plain, allowing the user to
+  select a Hermes checkout before deciding whether to download the enhanced UI.
 - Wizard behavior is verified twice: with a scripted UI for flow logic, and
   through a real pseudo-terminal for rendering and keybindings.
 
@@ -66,7 +80,8 @@ installer-ui`). The installer probes for it and falls back; it never runs pip.
 - **Ship a web or GUI installer.** Rejected. It adds a runtime and a port for a
   one-time setup task.
 - **Bundle `prompt_toolkit` as a hard dependency.** Rejected. The installer
-  must work in a bare Hermes environment, and it must never install packages.
+  must work in a bare Hermes environment; enhanced UI packages are optional and
+  downloaded only after consent into a disposable environment.
 - **Hand-roll raw ANSI and read single keys.** Rejected. Raw terminal handling
   is fragile across terminals and platforms, and easy to get wrong in ways that
   corrupt user input.
