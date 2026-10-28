@@ -1,11 +1,35 @@
 import getpass
 import os
 import sys
+import threading
 import unicodedata
+from contextlib import contextmanager
 
 
 BORDER = "─"
 HINT = "↑/↓ or j/k to move · Enter to select · Esc to cancel"
+
+
+@contextmanager
+def bootstrap_progress():
+    stop = threading.Event()
+    def animate():
+        frames = "|/-\\"
+        index = 0
+        while not stop.is_set():
+            sys.stdout.write("\r  " + frames[index % len(frames)] + " Preparing optional terminal UI (download may take a moment)")
+            sys.stdout.flush()
+            index += 1
+            stop.wait(0.1)
+    thread = threading.Thread(target=animate, daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join()
+        sys.stdout.write("\r\033[K")
+        sys.stdout.flush()
 
 
 def safe_text(value):

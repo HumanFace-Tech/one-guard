@@ -142,17 +142,25 @@ class BootstrapTests(unittest.TestCase):
             args.plain = True
             self.assertFalse(installer.installer_ui.wants_rich(args))
 
-    def test_reuses_hermes_venv_with_toolkit_when_terminal_eligible(self):
+    def test_hermes_interpreter_handoff_keeps_bootstrap_owned_by_parent(self):
         with tempfile.TemporaryDirectory() as temp:
             source = Path(temp)
             python = source / ".venv/bin/python"
             python.parent.mkdir(parents=True)
             python.touch()
-            with patch.object(installer.installer_ui, "rich_available", return_value=False), patch.object(installer.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as probe, patch.object(installer.os, "execve", side_effect=RuntimeError("reexec")) as execute, patch.dict(os.environ, {}, clear=True):
-                with self.assertRaisesRegex(RuntimeError, "reexec"):
-                    installer.load_yaml_module(source, [], prefer_ui=True)
-            self.assertIn("prompt_toolkit", probe.call_args.args[0][-1])
-            self.assertEqual(execute.call_args.args[0], str(python))
+            original_import = __import__
+            def missing(name, *args, **kwargs):
+                if name == "yaml":
+                    raise ImportError(name)
+                return original_import(name, *args, **kwargs)
+            with patch("builtins.__import__", side_effect=missing), patch.object(installer.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run, patch.object(installer, "managed_handoff", return_value=0) as handoff, patch.object(installer.os, "execve") as execute, patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(installer.InterpreterResult) as result:
+                    installer.load_yaml_module(source, [], ui_path="/temporary/ui")
+            self.assertEqual(result.exception.args[0], 0)
+            self.assertEqual(run.call_count, 1)
+            self.assertIn("/temporary/ui", handoff.call_args.args[0])
+            self.assertEqual(handoff.call_args.args[1]["ONE_GUARD_INSTALL_REEXEC"], "1")
+            execute.assert_not_called()
 
     def test_missing_required_dependencies_prevents_provision(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -170,7 +178,7 @@ class BootstrapTests(unittest.TestCase):
     def test_timeout_kills_process_group(self):
         process = Mock(pid=12345, returncode=0)
         process.communicate.side_effect = [subprocess.TimeoutExpired(["python"], 1), (b"", None)]
-        with patch.object(bootstrap.subprocess, "Popen", return_value=process), patch.object(bootstrap.os, "killpg") as kill:
+        with patch.object(bootstrap.subprocess, "Popen", return_value=process), patch.object(bootstrap.os, "killpg") as kill, patch.object(bootstrap.time, "monotonic", side_effect=[0, 0, 1]):
             with self.assertRaises(subprocess.TimeoutExpired):
                 bootstrap.run(["python"], {}, 1)
         kill.assert_called_once_with(12345, bootstrap.signal.SIGKILL)

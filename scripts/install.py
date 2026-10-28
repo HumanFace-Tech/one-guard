@@ -10,9 +10,11 @@ import math
 import os
 from pathlib import Path
 import shutil
+import signal
 import stat
 import subprocess
 import sys
+import threading
 import tempfile
 from urllib.parse import urlsplit
 
@@ -40,6 +42,60 @@ class InstallError(ValueError):
 
 class Cancelled(InstallError):
     pass
+
+
+class InterpreterResult(Exception):
+    pass
+
+
+class Interrupted(BaseException):
+    pass
+
+
+class SignalScope:
+    def __init__(self):
+        self.received = None
+        self.depth = 0
+        self.forward = None
+        self.previous = {}
+
+    def handle(self, signum, frame):
+        if self.received is not None:
+            return
+        self.received = signum
+        if self.forward is not None:
+            self.forward(signum)
+        elif not self.depth:
+            raise Interrupted()
+
+    def checkpoint(self, force=False):
+        if self.received is not None and (force or not self.depth):
+            raise Interrupted()
+
+    @contextlib.contextmanager
+    def shield(self, checkpoint=True):
+        self.depth += 1
+        try:
+            yield
+        finally:
+            self.depth -= 1
+        if checkpoint:
+            self.checkpoint()
+
+    def __enter__(self):
+        if threading.current_thread() is threading.main_thread():
+            for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+                self.previous[sig] = signal.getsignal(sig)
+                signal.signal(sig, self.handle)
+        return self
+
+    def __exit__(self, *exc):
+        for sig, handler in self.previous.items():
+            signal.signal(sig, handler)
+
+
+signals = SignalScope()
+installer_bootstrap.signal_scope = lambda: signals
 
 
 def safe_path(path):
@@ -131,23 +187,48 @@ def choose_source(ui):
         return answer
 
 
-def load_yaml_module(source, argv, prefer_ui=False):
+def managed_handoff(command, env):
+    """Forward cancellation and retain the capsule until the child exits."""
+    def forward(signum):
+        if child.poll() is None:
+            try:
+                child.send_signal(signum)
+            except ProcessLookupError:
+                pass
+    with signals.shield(checkpoint=False):
+        child = subprocess.Popen(command, env=env)
+        signals.forward = forward
+        try:
+            if signals.received is not None:
+                forward(signals.received)
+            child.wait()
+        finally:
+            signals.forward = None
+    return 128 + signals.received if signals.received else child.returncode
+
+
+def load_yaml_module(source, argv, prefer_ui=False, ui_path=None):
     yaml = None
     try:
         import yaml
         import dotenv
     except ImportError:
         yaml = None
-    probe_imports = "import yaml, dotenv" + (", prompt_toolkit" if prefer_ui else "")
-    if yaml is not None and (not prefer_ui or installer_ui.rich_available()):
+    probe_imports = "import yaml, dotenv"
+    if yaml is not None:
         return yaml
     python = source / ".venv/bin/python"
     if not os.environ.get("ONE_GUARD_INSTALL_REEXEC") and python.is_file():
         probe = subprocess.run([str(python), "-c", probe_imports], capture_output=True)
-        if probe.returncode and yaml is None and prefer_ui:
-            probe = subprocess.run([str(python), "-c", "import yaml, dotenv"], capture_output=True)
         if probe.returncode == 0:
             env = dict(os.environ, ONE_GUARD_INSTALL_REEXEC="1")
+            if ui_path:
+                code = ("import sys, runpy; sys.path.insert(0, sys.argv.pop(1)); "
+                        "sys.argv[0] = sys.argv.pop(1); runpy.run_path(sys.argv[0], run_name='__main__')")
+                result = managed_handoff([str(python), "-c", code, ui_path,
+                                          str(Path(__file__).resolve()), *argv,
+                                          "--hermes-dir", str(source)], env)
+                raise InterpreterResult(result)
             os.execve(str(python), [str(python), str(Path(__file__).resolve()), *argv,
                                     "--hermes-dir", str(source)], env)
     if yaml is not None:
@@ -443,46 +524,57 @@ def write_private(path, data):
 def apply_install(home, files, config_bytes, env_bytes):
     plugins = home / "plugins"
     target = plugins / PLUGIN
-    backup = Path(tempfile.mkdtemp(prefix=".one-guard-backup-", dir=home))
-    stage = Path(tempfile.mkdtemp(prefix=".one-guard-stage-", dir=home))
     moved = False
     installed = False
     written = []
     originals = {}
-    try:
-        for name, data in (("config.yaml", config_bytes), (".env", env_bytes)):
-            path = home / name
-            originals[name] = path.exists()
-            if originals[name]:
-                write_private(backup / name, read_regular(path))
-            write_private(backup / ("new-" + name), data)
-        for name, data in files.items():
-            dest = stage / name
-            dest.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            write_private(dest, data)
-        write_private(stage / MARKER, json.dumps({"format": 1, "files": hashes(files)}, sort_keys=True).encode())
-        if target.exists():
-            os.replace(target, backup / PLUGIN)
-            moved = True
-        os.replace(stage, target)
-        installed = True
-        for name in (".env", "config.yaml"):
-            os.replace(backup / ("new-" + name), home / name)
-            written.append(name)
-    except BaseException:
-        for name in reversed(written):
-            if originals[name]:
-                os.replace(backup / name, home / name)
-            else:
-                (home / name).unlink()
-        if installed:
-            os.replace(target, backup / "failed-install")
-        if moved:
-            os.replace(backup / PLUGIN, target)
-        raise
-    finally:
-        if stage.exists():
-            shutil.rmtree(stage)
+    stage = None
+    with signals.shield(checkpoint=False):
+        try:
+            signals.checkpoint(force=True)
+            backup = Path(tempfile.mkdtemp(prefix=".one-guard-backup-", dir=home))
+            signals.checkpoint(force=True)
+            stage = Path(tempfile.mkdtemp(prefix=".one-guard-stage-", dir=home))
+            signals.checkpoint(force=True)
+            for name, data in (("config.yaml", config_bytes), (".env", env_bytes)):
+                path = home / name
+                originals[name] = path.exists()
+                if originals[name]:
+                    write_private(backup / name, read_regular(path))
+                write_private(backup / ("new-" + name), data)
+                signals.checkpoint(force=True)
+            for name, data in files.items():
+                dest = stage / name
+                dest.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                write_private(dest, data)
+                signals.checkpoint(force=True)
+            write_private(stage / MARKER, json.dumps({"format": 1, "files": hashes(files)}, sort_keys=True).encode())
+            signals.checkpoint(force=True)
+            if target.exists():
+                os.replace(target, backup / PLUGIN)
+                moved = True
+                signals.checkpoint(force=True)
+            os.replace(stage, target)
+            installed = True
+            signals.checkpoint(force=True)
+            for name in (".env", "config.yaml"):
+                os.replace(backup / ("new-" + name), home / name)
+                written.append(name)
+                signals.checkpoint(force=True)
+        except BaseException:
+            for name in reversed(written):
+                if originals[name]:
+                    os.replace(backup / name, home / name)
+                else:
+                    (home / name).unlink()
+            if installed:
+                os.replace(target, backup / "failed-install")
+            if moved:
+                os.replace(backup / PLUGIN, target)
+            raise
+        finally:
+            if stage is not None and stage.exists():
+                shutil.rmtree(stage)
     return backup
 
 
@@ -731,8 +823,26 @@ def parser():
 
 
 def main(argv=None):
-    with contextlib.ExitStack() as stack:
-        return _main(argv, stack)
+    global signals
+    previous = signals
+    signals = SignalScope()
+    try:
+        with signals:
+            try:
+                with contextlib.ExitStack() as stack:
+                    try:
+                        result = _main(argv, stack)
+                        signals.checkpoint()
+                    finally:
+                        with signals.shield(checkpoint=False):
+                            stack.close()
+                signals.checkpoint()
+                return result
+            except Interrupted:
+                print("Error: Installation interrupted.", file=sys.stderr)
+                return 128 + signals.received
+    finally:
+        signals = previous
 
 
 def _main(argv, stack):
@@ -751,22 +861,26 @@ def _main(argv, stack):
         else:
             ui = installer_ui.create_ui(args)
             ui.header("ONE GUARD", "A native Hermes tool guard · Configure, review, then install · Ctrl-C cancels")
-            source = select_source(args.hermes_dir, ui=ui)
-            yaml = load_yaml_module(source, argv, prefer_ui=installer_ui.wants_rich(args))
-            if installer_ui.wants_rich(args) and not installer_ui.rich_available():
+            ui_path = None
+            if (not os.environ.get("ONE_GUARD_INSTALL_REEXEC") and installer_ui.wants_rich(args)
+                    and not installer_ui.rich_available()):
                 choice = ui.choose("Optional enhanced terminal UI: download pinned packages into a temporary private environment?",
                                    [(False, "No, continue with plain setup"),
                                     (True, "Yes, download the optional terminal UI")])
                 if choice:
                     try:
                         with contextlib.ExitStack() as provision:
-                            provision.enter_context(installer_bootstrap.provision())
+                            with installer_ui.bootstrap_progress():
+                                ui_path = provision.enter_context(installer_bootstrap.provision())
                             if not installer_ui.rich_available():
                                 raise ImportError("Optional UI unavailable")
                             ui = installer_ui.create_ui(args)
                             stack.enter_context(provision.pop_all())
                     except (OSError, ValueError, ImportError, subprocess.SubprocessError):
+                        ui_path = None
                         ui.say("Optional UI unavailable; continuing with plain setup.")
+            source = select_source(args.hermes_dir, ui=ui)
+            yaml = load_yaml_module(source, argv, ui_path=ui_path)
             source, home, token, clear_token = run_wizard(ui, args, source, yaml)
         for directory in (home, home / "plugins"):
             safe_path(directory)
@@ -797,6 +911,8 @@ def _main(argv, stack):
         if args.yes:
             warn_hook_budget(parse_config(serialized, yaml))
         return 0
+    except InterpreterResult as exc:
+        return exc.args[0]
     except Cancelled as exc:
         print("Error: " + installer_ui.safe_text(str(exc)), file=sys.stderr)
         return 1
@@ -813,7 +929,7 @@ def _main(argv, stack):
         print("Error: " + (ui.clean(message) if ui else installer_ui.safe_text(message)), file=sys.stderr)
         return 1
     except KeyboardInterrupt:
-        print("Error: Installation interrupted. No Hermes files were written.", file=sys.stderr)
+        print("Error: Installation interrupted.", file=sys.stderr)
         return 1
 
 

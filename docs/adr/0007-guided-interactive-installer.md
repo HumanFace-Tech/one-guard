@@ -67,9 +67,8 @@ already be available in the active Python or Hermes `.venv`.
 - The optional UI bootstrap reaches PyPI only after explicit consent. It does
   not install Hermes, system packages, plugin runtime dependencies, a model, or
   an inference server. `--yes`, `--plain`, `NO_COLOR`, and `TERM=dumb` skip the
-  bootstrap offer. The initial source selector uses the enhanced UI when the
-  toolkit is already available; otherwise it is plain, allowing the user to
-  select a Hermes checkout before deciding whether to download the enhanced UI.
+  bootstrap offer. When the toolkit is unavailable, the installer offers the
+  optional download before the initial source selector, with a plain fallback.
 - Wizard behavior is verified twice: with a scripted UI for flow logic, and
   through a real pseudo-terminal for rendering and keybindings.
 

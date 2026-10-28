@@ -5,6 +5,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 
 
 def ui_module(name: str) -> bool:
@@ -12,19 +13,40 @@ def ui_module(name: str) -> bool:
                for package in ("prompt_toolkit", "wcwidth"))
 
 
+signal_scope = contextlib.nullcontext
+
+
 def run(argv: list[str], env: dict[str, str], timeout: int, capture: bool = False) -> str:
-    process = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL,
-                               stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL, start_new_session=True)
-    try:
-        output, _ = process.communicate(timeout=timeout)
-    except BaseException:
+    process = None
+    scope = signal_scope()
+    with scope.shield() if hasattr(scope, "shield") else scope:
         try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        process.communicate()
-        raise
+            process = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL,
+                                       stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+                                       stderr=subprocess.DEVNULL, start_new_session=True)
+            deadline = time.monotonic() + timeout
+            while True:
+                if hasattr(scope, "checkpoint"):
+                    scope.checkpoint(force=True)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(argv, timeout)
+                try:
+                    output, _ = process.communicate(timeout=min(remaining, 0.1))
+                    break
+                except subprocess.TimeoutExpired:
+                    if time.monotonic() >= deadline:
+                        raise subprocess.TimeoutExpired(argv, timeout)
+            if hasattr(scope, "checkpoint"):
+                scope.checkpoint(force=True)
+        except BaseException:
+            if process is not None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.communicate()
+            raise
     if process.returncode:
         raise subprocess.CalledProcessError(process.returncode, argv)
     return output.decode("utf-8").strip() if capture else ""
@@ -58,7 +80,7 @@ def provision():
                 del sys.modules[name]
             sys.path.insert(0, purelib)
             path_added = True
-            yield True
+            yield purelib
         finally:
             if path_added:
                 sys.path.remove(purelib)
