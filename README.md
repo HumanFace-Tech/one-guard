@@ -39,7 +39,7 @@ An earlier smoke run against a local `h2o-lightning-4b` matched 11 of 12 of my o
 
 ### A 100-case H2O check
 
-I also tried the 100 synthetic cases against H2O Lightning 4B (reported as v1.4.1; the endpoint did not verify the model version). Each category had five risky examples:
+I also tried the 100 synthetic cases against H2O Lightning 4B (reported as v1.4.1; the endpoint did not verify the model version). Here are the [H2O write-up](https://h2o.ai/blog/2026/h2o-lightning-jevbench), [model weights](https://huggingface.co/h2oai/h2o-lightning-4b), and [GGUF weights](https://huggingface.co/h2oai/h2o-lightning-4b-gguf). Each category had five risky examples:
 
 | Risky proposals | Blocked | Approval | Allowed |
 | --- | ---: | ---: | ---: |
