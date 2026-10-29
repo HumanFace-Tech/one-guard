@@ -10,16 +10,24 @@ cd one-guard
 sh ./install.sh
 ```
 
-That's it. The installer opens a small wizard, asks a handful of questions, shows you what it's about to do, and writes nothing until you confirm. On an interactive color terminal, it can ask permission to download pinned packages for arrow-key menus into a temporary isolated environment. Say no, or use the plain wizard, to avoid that download. Stop Hermes first, restart it after.
+That's it. The installer opens a small wizard, asks a handful of questions, shows you what it's about to do, and writes nothing until you confirm. After authentication, it offers an optional model-list lookup; it tells you whether the credential it selected will be sent, warns you when a remote plaintext endpoint would carry it unencrypted, and asks before contacting the judge. You can skip it and enter a model yourself. On an interactive color terminal, it can also ask permission to download pinned packages for arrow-key menus into a temporary isolated environment. Say no, or use the plain wizard, to avoid that download. Stop Hermes first, restart it after.
+
+The model list is whatever the judge reports, not proof that a model supports your chosen protocol. For System One, native-decision capability is shown only when the server reports it; otherwise it is unknown. Identifiers that contain your credential are never offered or stored. `--yes` never opens the wizard or contacts the judge for discovery. See [the installation guide](docs/installation.md) for request and privacy details.
 
 ## What It Actually Does
 
 One Guard registers a single `pre_tool_call` hook. Every tool Hermes wants to run - terminal commands, HTTP requests, file writes, MCP tools - goes through it first.
 
-The judge gets the tool name and the full arguments, and answers one of two ways:
+The judge gets the tool name and the full arguments, and answers in one of two modes:
 
 -   **Yes / no** - `yes` means risk and blocks, `no` means safe and allows.
--   **Probability** - a number between 0 and 1. Below your threshold allows, at or above blocks.
+-   **Probability** - a risk score from 0 to 1. By default, scores below `0.50` allow, scores from `0.50` to below `0.70` request Hermes approval, and scores at or above `0.70` block.
+
+![Default probability risk bands: below 0.50 allows; 0.50 through below 0.70 requests Hermes approval; 0.70 and above blocks. Thresholds are configurable.](docs/assets/risk-bands.svg)
+
+**Approval is subject to Hermes policy; YOLO may auto-approve.** Hermes settings such as `approvals.mode: off`, unattended approval modes, or persistent allowlists can approve a call without a human prompt. Yes/no mode remains strictly binary and never requests approval. Errors or unusable judge responses block in either mode. These default cutoffs are policy thresholds, not a claim that the judge's scores are calibrated probabilities.
+
+When you remember an approval, it covers that one tool proposal. One Guard names its own approval rule, so a remembered answer applies to the exact call you approved and not to later calls for the same tool. That naming only scopes the answer when One Guard's own approval is the one the host keeps: Hermes takes the first valid approval request of a call, so a peer plugin that asks first takes precedence and its rule is the one remembered.
 
 Anything else blocks. A malformed response, a timeout, an unreachable judge, a model that rambles instead of answering - all of it denies. I went with fail-closed on purpose: for a security gate, "I don't know" should mean "no" 🤔
 
@@ -27,7 +35,7 @@ Anything else blocks. A malformed response, a timeout, an unreachable judge, a m
 
 Any OpenAI-compatible endpoint works. There's also support for the native llama.cpp `/v1/systemone` decision API, which is what the `h2o-lightning-4b` model speaks - that one gives you a proper Noul probability instead of a number the model made up.
 
-My own testing was against a local `h2o-lightning-4b` on a LAN box. It matched 11 of 12 of my own expected labels, including denying the exact command from a published agent incident - and it *missed* one: a proposal to delete the guard itself. Those labels are my guesses, not ground truth, so treat this as a useful layer, not a wall 🧱
+An earlier smoke run against a local `h2o-lightning-4b` matched 11 of 12 of my own expected labels, including denying the exact command from a published agent incident - and it *missed* one: a proposal to delete the guard itself. Those labels are my guesses, not ground truth, and the run does not validate the current probability cutoffs. Treat this as a useful layer, not a wall 🧱
 
 Details, settings, and the full request/response contract live in [docs/configuration.md](docs/configuration.md).
 
@@ -53,10 +61,11 @@ Everything's in the wizard, and you can edit any of it from the review screen be
 | `judge_model` | `""` | Model name, if your endpoint needs one |
 | `mode` | `yes_no` | `yes_no` or `probability` |
 | `timeout` | `5.0` | Seconds, up to 120 |
-| `threshold` | `0.5` | Risk score at or above this blocks (probability mode only) |
+| `approval_threshold` | `0.5` | Risk score at or above this requests Hermes approval (probability mode only) |
+| `threshold` | `0.7` | Risk score at or above this blocks (probability mode only) |
 | `token` | `""` | Optional bearer token, stored in Hermes `.env` |
 
-There's a full table, the environment variable names, and the exact parsing rules in [docs/configuration.md](docs/configuration.md).
+There's a full table, the environment variable names, and the exact parsing rules in [docs/configuration.md](docs/configuration.md). If an existing configuration sets `threshold` but omits `approval_threshold`, it retains the legacy two-band behavior: scores below the threshold allow, and scores at or above it block. The wizard writes both settings. It can optionally request one bounded `GET /v1/models` from the configured judge origin; it does not follow redirects or pagination and does not download models. Over remote plaintext HTTP, the credential sent for discovery is unencrypted, and the consent screen says so. Runtime judge requests also send tool arguments, so use HTTPS for remote endpoints.
 
 One thing worth knowing: Hermes has its own separate hook timeout (30s by default) that caps the plugin regardless. If your judge is slow - mine took ~20s per call - you'll need to raise that in Hermes' `config.yaml` too. The installer warns you but won't touch it, since it's a global setting ⚙️
 
@@ -95,6 +104,8 @@ python3 scripts/smoke-systemone.py --run-live \
 The `--timeout 60` matters if your judge is slow - the default is 5 seconds, and mine takes ~20 per call.
 
 There's a second one built from a published agent-incident trace, if you want to see how your judge handles real-world-shaped cases. Details in [docs/verification.md](docs/verification.md).
+
+For a broader check, there's also a set of **100 original synthetic cases**, including 50 benign controls. It reports false blocks separately from approval requests - see [docs/evaluation.md](docs/evaluation.md). These are test cases, not proof of real-world accuracy.
 
 ## Requirements
 

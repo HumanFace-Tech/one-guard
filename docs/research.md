@@ -19,6 +19,18 @@ This source behavior differs from older plugin documentation that described call
 
 Hermes also has shell hooks in `agent/shell_hooks.py` and `hermes_cli/config_defaults.py`, with timeout and `fail_closed` controls. One Guard chooses the native plugin interface because it directly returns the policy directive and avoids a separate shell subprocess configuration path. The choice is documented in [ADR 0001](adr/0001-native-pre-tool-hook.md).
 
+### The approve directive and the host approval gate
+
+The same checked source documents the second directive shape. `_get_pre_tool_call_directive_details` in `hermes_cli/plugins.py` (around lines 1907-1959) accepts `{"action": "block", ...}` and `{"action": "approve", "message", "rule_key"?}`, with `block` taking precedence over `approve` regardless of registration order, and among approves the first valid one wins. An `approve` result escalates that tool call to the human approval gate.
+
+`_resolve_block_from_details` (around lines 1982-2010) is the single place that resolves the directive: a `block` blocks with its message, and an `approve` whose gate errors, denies, or times out also blocks. It calls `tools.approval.request_tool_approval` with `rule_key=details.rule_key or tool_name`, so the `rule_key` a plugin returns is the `[a]lways` allowlist grain.
+
+That call site matters for the fallback. `request_tool_approval` in `tools/approval.py` (around lines 1124-1155) derives a rule key from the tool name and a hash of the reason only when it receives an empty `rule_key`. The dispatcher substitutes the bare tool name before it ever gets there, so a plugin that returns no `rule_key` is keyed by the tool name alone: the reason hash is unreachable from this path, and a remembered answer covers every later escalation of that tool, including escalations other plugins request. One Guard therefore returns its own `rule_key`.
+
+`tools/approval.py` owns that gate. Its `_run_approval_gate` (around lines 968-1046) resolves the YOLO bypass, the `approvals.mode: off` bypass, and the session or permanent allowlist before it asks a human; a non-interactive context with no bridge fails closed for a plugin-flagged action. `request_tool_approval` (around lines 1124-1155) is the plugin entry point. One Guard uses that public path and adds no middleware, monkeypatch, or core patch. See [ADR 0008](adr/0008-three-band-approval-policy.md) and [ADR 0009](adr/0009-namespaced-approval-rule-key.md).
+
+A host that does not implement the `approve` directive would ignore it and run a mid-band call without a human. The plugin therefore targets the pinned revision, and the review band needs that host.
+
 ### C1 proposal-to-execution boundary
 
 An offline source probe demonstrated a peer `pre_tool_call` `modify` directive changing arguments after the original is judged, through both `model_tools.handle_function_call` and the agent executor. In the pinned source, `agent/tool_executor.py:672-686` obtains modified arguments from `_dispatch_pre_tool_call_hooks`; `:712-759` applies them before guardrails and dispatch. Hook-visible proposals are therefore not immutable final execution arguments.

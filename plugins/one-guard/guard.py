@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import enum
+import hashlib
 import http.client
 import ipaddress
 import io
@@ -42,10 +44,79 @@ DEFAULTS = {
     "prompt": "",
     "mode": "yes_no",
     "timeout": 5.0,
-    "threshold": 0.5,
+    "threshold": 0.7,
+    "approval_threshold": 0.5,
     "allow_insecure_http": False,
 }
 _SLOTS = threading.BoundedSemaphore(4)
+_UNSET = object()
+
+RULE_KEY_NAMESPACE = "one-guard"
+"""Namespace for the host approval grain.
+
+Hermes keys remembered approvals by the ``rule_key`` a plugin returns, and falls back to
+the bare tool name when a plugin returns none. Namespacing keeps a One Guard answer from
+colliding with another plugin's rule for the same tool.
+"""
+
+_RULE_KEY_DOMAIN = b"one-guard/approval-rule-key/v1\x00"
+
+DENY_MESSAGE = "One Guard denied this tool call: risk or unavailable safe judgment."
+INVALID_CONFIG_MESSAGE = ("One Guard denied this tool call: the guard configuration "
+                           "is invalid.")
+
+
+class Decision(str, enum.Enum):
+    """The outcome of one judgment: allow, ask the human, or deny."""
+
+    ALLOW = "allow"
+    APPROVE = "approve"
+    DENY = "deny"
+
+
+@dataclass(frozen=True)
+class Outcome:
+    """A judgment result. ``score`` is the judge risk score when one was produced."""
+
+    decision: Decision
+    score: float | None = None
+
+    @property
+    def allowed(self):
+        return self.decision is Decision.ALLOW
+
+
+DENIED = Outcome(Decision.DENY)
+
+
+def resolve_thresholds(block, approval):
+    """Resolve the effective (block cutoff, approval cutoff).
+
+    ``block`` and ``approval`` are the operator's configured values, or ``None`` when the
+    setting is absent. A configured block cutoff without a configured approval cutoff keeps
+    the legacy two-band behaviour: the approval cutoff follows the block cutoff, so the
+    review band stays empty and the old "allow below, deny at or above" rule is preserved
+    exactly. An approval cutoff above the block cutoff is reduced to the block cutoff, so
+    the block cutoff always wins: that clamp never widens what is allowed and never makes
+    the configuration invalid.
+    """
+    block_value = DEFAULTS["threshold"] if block is None else block
+    if approval is None:
+        approval_value = block_value if block is not None else DEFAULTS["approval_threshold"]
+    else:
+        approval_value = approval
+    if type(block_value) in (int, float) and type(approval_value) in (int, float):
+        return block_value, min(approval_value, block_value)
+    return block_value, approval_value
+
+
+def band_decision(score, approval_threshold, threshold):
+    """Map a risk score onto the three bands: allow, review, or deny."""
+    if score < approval_threshold:
+        return Decision.ALLOW
+    if score < threshold:
+        return Decision.APPROVE
+    return Decision.DENY
 
 
 def _reject(*args):
@@ -103,11 +174,11 @@ def _json_data(value, depth=0, budget=None):
     _reject()
 
 
-def bounded_json(value, limit):
+def bounded_json(value, limit, sort_keys=False):
     _json_data(value)
     chunks = []
     size = 0
-    for part in json.JSONEncoder(ensure_ascii=False, allow_nan=False,
+    for part in json.JSONEncoder(ensure_ascii=False, allow_nan=False, sort_keys=sort_keys,
                                  separators=(",", ":")).iterencode(value):
         if len(part) > limit:
             _reject()
@@ -128,13 +199,15 @@ class Config:
     prompt: str = ""
     mode: str = "yes_no"
     timeout: float = 5.0
-    threshold: float = 0.5
+    threshold: float = DEFAULTS["threshold"]
+    approval_threshold: float = DEFAULTS["approval_threshold"]
     allow_insecure_http: bool = False
 
     @classmethod
     def from_context(cls, ctx, environ=None):
         env = os.environ if environ is None else environ
         values = {}
+        configured = set()
         for key, default in DEFAULTS.items():
             name = "ONE_GUARD_MODEL" if key == "judge_model" else "ONE_GUARD_" + key.upper()
             if key == "token":
@@ -147,13 +220,29 @@ class Config:
                         value = get_secret(name, "")
                 else:
                     value = env.get(name, "")
+            elif key in ("threshold", "approval_threshold"):
+                if name in env:
+                    value = strict_json(env[name])
+                    configured.add(key)
+                else:
+                    value = ctx.get_config(key, _UNSET)
+                    if value is _UNSET:
+                        value = default
+                    else:
+                        configured.add(key)
             else:
                 value = env[name] if name in env else ctx.get_config(key, default)
-            if name in env and key in ("timeout", "threshold"):
+            if name in env and key == "timeout":
                 value = strict_json(value)
             if name in env and key == "allow_insecure_http":
                 value = strict_json(value)
             values["model" if key == "judge_model" else key] = value
+        block, approval = resolve_thresholds(
+            values["threshold"] if "threshold" in configured else None,
+            values["approval_threshold"] if "approval_threshold" in configured else None)
+        if not any(key in configured and values[key] is None for key in ("threshold", "approval_threshold")):
+            values["threshold"] = block
+            values["approval_threshold"] = approval
         return cls(**values).validate()
 
     def validate(self):
@@ -170,6 +259,9 @@ class Config:
             _reject()
         _number(self.timeout, 0.01, 120.0)
         _number(self.threshold, 0.0, 1.0)
+        _number(self.approval_threshold, 0.0, 1.0)
+        if self.approval_threshold > self.threshold:
+            _reject()
         if type(self.allow_insecure_http) is not bool:
             _reject()
         url = urlsplit(self.endpoint)
@@ -189,20 +281,24 @@ class Config:
         return self
 
 
-def parse_verdict(content, mode, threshold):
+def parse_verdict(content, mode, approval_threshold, threshold):
+    """Validate the judge content and map it onto a decision."""
     value = strict_json(content)
     if mode == "yes_no":
         if type(value) is not dict or set(value) != {"verdict"}:
             _reject()
         if type(value["verdict"]) is not str or value["verdict"] not in ("yes", "no"):
             _reject()
-        return value["verdict"] == "no"
+        return Outcome(Decision.ALLOW if value["verdict"] == "no" else Decision.DENY)
     if mode == "probability":
-        return _number(value, 0.0, 1.0) < _number(threshold, 0.0, 1.0)
+        score = _number(value, 0.0, 1.0)
+        return Outcome(band_decision(score, _number(approval_threshold, 0.0, 1.0),
+                                     _number(threshold, 0.0, 1.0)), score)
     _reject()
 
 
-def parse_systemone(envelope: object, mode: str, threshold: float) -> bool:
+def parse_systemone(envelope: object, mode: str, approval_threshold: float,
+                    threshold: float) -> Outcome:
     """Validate the single risk answer; malformed or ambiguous answers raise."""
     if type(envelope) is not dict or set(envelope) != {"model", "answers", "usage"}:
         _reject()
@@ -222,7 +318,9 @@ def parse_systemone(envelope: object, mode: str, threshold: float) -> bool:
     if mode == "probability":
         if set(answer) != {"type", "noul"} or answer["type"] != "noul":
             _reject()
-        return _number(answer["noul"], 0, 1) < _number(threshold, 0, 1)
+        score = _number(answer["noul"], 0, 1)
+        return Outcome(band_decision(score, _number(approval_threshold, 0, 1),
+                                     _number(threshold, 0, 1)), score)
     if mode != "yes_no" or set(answer) != {"type", "choice", "probabilities", "confidence"}:
         _reject()
     if answer["type"] != "choice" or type(answer["choice"]) is not str or answer["choice"] not in ("yes", "no"):
@@ -237,7 +335,7 @@ def parse_systemone(envelope: object, mode: str, threshold: float) -> bool:
         _reject()
     if (answer["choice"] == "yes" and yes < no) or (answer["choice"] == "no" and no < yes):
         _reject()
-    return answer["choice"] == "no" and no > yes
+    return Outcome(Decision.ALLOW if (answer["choice"] == "no" and no > yes) else Decision.DENY)
 
 
 def build_payload(config, tool_name, args):
@@ -275,6 +373,36 @@ def build_payload(config, tool_name, args):
     if config.model:
         payload["model"] = config.model
     return bounded_json(payload, MAX_REQUEST_BYTES)
+
+
+def canonical_proposal_bytes(tool_name, args):
+    """Serialize the judged proposal into bounded canonical bytes.
+
+    The bytes cover the full validated ``{tool_name, args}`` pair under the same rules and
+    the same size limit as the judge request. Object keys are sorted, so the same proposal
+    always produces the same bytes whatever order the caller happened to build the mapping
+    in. The bytes are digest input only; no raw argument leaves this function.
+    """
+    if type(tool_name) is not str or not tool_name or type(args) is not dict:
+        _reject()
+    return bounded_json({"tool_name": tool_name, "args": args}, MAX_ARGUMENT_BYTES,
+                         sort_keys=True)
+
+
+def approval_rule_key(tool_name, args):
+    """The host allowlist grain for one judged proposal.
+
+    The key is a namespaced SHA256 digest of the canonical bounded proposal, so a
+    remembered ``session`` or ``always`` answer applies to that exact proposal and not to
+    every later review-band call for the same tool. The digest carries no raw arguments,
+    no credentials, and no judge score: the score decides whether a proposal enters the
+    review band, while the host owns what happens there. Serialization failure raises and
+    the caller denies, so a proposal that cannot be identified never reaches the gate
+    under a coarser key.
+    """
+    digest = hashlib.sha256(_RULE_KEY_DOMAIN +
+                            canonical_proposal_bytes(tool_name, args)).hexdigest()
+    return f"{RULE_KEY_NAMESPACE}:{digest}"
 
 
 def _remaining(deadline):
@@ -365,7 +493,8 @@ def _exchange(config, payload, deadline):
             _reject()
         envelope = strict_json(raw.decode("utf-8"))
         if config.protocol == "systemone":
-            verdict = parse_systemone(envelope, config.mode, config.threshold)
+            verdict = parse_systemone(envelope, config.mode, config.approval_threshold,
+                                      config.threshold)
             _remaining(deadline)
             return verdict
         if type(envelope) is not dict:
@@ -380,7 +509,8 @@ def _exchange(config, payload, deadline):
                 or message.get("tool_calls") or message.get("function_call")
                 or type(message.get("content")) is not str):
             _reject()
-        verdict = parse_verdict(message["content"], config.mode, config.threshold)
+        verdict = parse_verdict(message["content"], config.mode, config.approval_threshold,
+                                config.threshold)
         _remaining(deadline)
         return verdict
     finally:
@@ -392,21 +522,22 @@ def _exchange(config, payload, deadline):
 
 
 def judge(config, tool_name, args):
+    """Ask the judge and return its Outcome. Any failure denies."""
     deadline = time.monotonic() + config.timeout
     config.validate()
     payload = build_payload(config, tool_name, args)
     if not _SLOTS.acquire(timeout=max(0, deadline - time.monotonic())):
-        return False
+        return DENIED
     if time.monotonic() >= deadline:
         _SLOTS.release()
-        return False
+        return DENIED
     result = queue.Queue(maxsize=1)
 
     def run():
         try:
             result.put(_exchange(config, payload, deadline))
         except Exception:
-            result.put(False)
+            result.put(DENIED)
         finally:
             _SLOTS.release()
 
@@ -419,7 +550,15 @@ def judge(config, tool_name, args):
     try:
         return result.get(timeout=max(0, deadline - time.monotonic()))
     except queue.Empty:
-        return False
+        return DENIED
+
+
+def approval_message(outcome, config):
+    """The human-facing reason for the review band. It carries no tool data or secret."""
+    score = "unknown" if outcome.score is None else f"{outcome.score:.2f}"
+    return ("One Guard requires approval: the judge scored this proposal "
+            f"{score}, inside the review band {config.approval_threshold:.2f} to "
+            f"{config.threshold:.2f}.")
 
 
 class Guard:
@@ -429,8 +568,19 @@ class Guard:
     def pre_tool_call(self, tool_name=None, args=None, **kwargs):
         try:
             config = Config.from_context(self.ctx)
-            if judge(config, tool_name, args):
-                return None
         except Exception:
-            pass
-        return {"action": "block", "message": "One Guard denied this tool call: risk or unavailable safe judgment."}
+            return {"action": "block", "message": INVALID_CONFIG_MESSAGE}
+        try:
+            outcome = judge(config, tool_name, args)
+        except Exception:
+            return {"action": "block", "message": DENY_MESSAGE}
+        if outcome.decision is Decision.ALLOW:
+            return None
+        if outcome.decision is Decision.APPROVE:
+            try:
+                rule_key = approval_rule_key(tool_name, args)
+            except Exception:
+                return {"action": "block", "message": DENY_MESSAGE}
+            return {"action": "approve", "message": approval_message(outcome, config),
+                    "rule_key": rule_key}
+        return {"action": "block", "message": DENY_MESSAGE}

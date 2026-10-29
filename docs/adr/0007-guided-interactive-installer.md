@@ -28,10 +28,31 @@ automation and for CI.
 Add a guided wizard to `scripts/install.py`, with terminal rendering isolated in
 a new sibling module `scripts/installer_ui.py`.
 
-The wizard has six steps: Hermes source, Hermes data home, judge connection,
-decision policy, authentication, and a review screen that is the only place an
-install can be confirmed. Every step is re-entrant from the review screen, so a
-user can go back and change one field without restarting.
+The wizard has seven steps: Hermes source, Hermes data home, judge connection,
+decision policy, authentication, optional model discovery, and a review screen
+that is the only place an install can be confirmed. Every step is re-entrant
+from the review screen, so a user can go back and change one field without
+restarting.
+
+Model discovery is opt-in and occurs after authentication. The wizard explains
+that it will make one direct `GET /v1/models` request to the configured endpoint's
+origin and whether the credential selected by this installer will accompany it.
+The credential is the one stored in the Hermes `.env` by this installation;
+Hermes resolves the runtime credential from its own profile and environment, so
+the two can differ. A remote plaintext HTTP endpoint is called out as carrying
+that credential unencrypted, or, without one, as exposing the request itself. The
+request is bounded, does not follow redirects or pagination, and has a manual
+model-entry fallback when the endpoint is offline or returns unusable data.
+Returned identifiers and System One capability metadata are server claims, not
+verified model/protocol compatibility. Discovery does not download or load a
+model. `--yes` retains its non-interactive contract and never makes this request.
+
+Identifiers that contain the selected credential anywhere are dropped before the
+list is shown, so a hostile judge cannot steer the credential into `judge_model`.
+The rule is conservative: a short credential suppresses every identifier that
+contains it. Identifiers carrying Unicode control or format characters are
+dropped, and capability is reported as unknown unless the server explicitly lists
+`decisions` or lists exactly `text`.
 
 Two rendering backends sit behind one interface:
 
@@ -59,18 +80,27 @@ already be available in the active Python or Hermes `.venv`.
   and the temporary environment is removed on exit.
 - The credential is entered through a masked field, is excluded from prompt
   history, is replaced with `[credential]` on every output path, and never
-  reaches `config.yaml`.
+  reaches `config.yaml`. A model identifier typed by hand stays the operator's
+  own choice; the installer warns when it contains the selected credential,
+  because that credential would then be written to `config.yaml`.
 - Terminal output escapes control characters, so an untrusted model name or
   endpoint cannot emit ANSI escapes into the user's terminal.
 - The installer is now more complex, and `scripts/installer_ui.py` must stay a
   sibling of `scripts/install.py` because it is loaded by path.
+- The opt-in model-list request adds a network action to the wizard, so consent
+  is specific and informed: a credential selected by this installer may be sent
+  to the configured origin. Remote plaintext HTTP exposes that credential in
+  transit, and the consent screen says so before the request is made. Automated
+  model-discovery tests use a loopback stub, including a self-signed TLS stub;
+  they do not establish live service behavior or actual model compatibility.
 - The optional UI bootstrap reaches PyPI only after explicit consent. It does
   not install Hermes, system packages, plugin runtime dependencies, a model, or
   an inference server. `--yes`, `--plain`, `NO_COLOR`, and `TERM=dumb` skip the
   bootstrap offer. When the toolkit is unavailable, the installer offers the
   optional download before the initial source selector, with a plain fallback.
-- Wizard behavior is verified twice: with a scripted UI for flow logic, and
-  through a real pseudo-terminal for rendering and keybindings.
+- Wizard behavior is verified with a scripted UI for flow logic, loopback HTTP
+  stubs for discovery boundaries, and a real pseudo-terminal for rendering and
+  keybindings.
 
 ## Alternatives considered
 

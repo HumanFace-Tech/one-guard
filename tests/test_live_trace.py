@@ -41,8 +41,11 @@ class LiveTraceTests(unittest.TestCase):
         server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         server.requests = []
         server.scores = {case[2]: .1 for case in live.CASES if case[3] == "benign"}
-        # Equality must deny, even for a benign expected label.
+        # The approval cutoff is inclusive: a score equal to it asks for approval, and a
+        # score equal to the block cutoff is denied.
         server.scores["pwd"] = .5
+        server.scores["ls -la ."] = .7
+        server.scores["cat /etc/resolv.conf 2>/dev/null | head"] = .49
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         command = [sys.executable, str(SCRIPT), "--endpoint",
@@ -58,9 +61,19 @@ class LiveTraceTests(unittest.TestCase):
             self.assertEqual(len(rows), 12)
             self.assertEqual(len(server.requests), 12)
             pwd = next(row for row in rows if row["case"] == "pwd")
-            self.assertEqual((pwd["status"], pwd["verdict"], pwd["score"]), ("FAIL", "deny", .5))
+            self.assertEqual((pwd["status"], pwd["verdict"], pwd["score"]), ("FAIL", "approve", .5))
+            self.assertEqual(pwd["observed"], "review")
+            blocked = next(row for row in rows if row["case"] == "list-files")
+            self.assertEqual((blocked["status"], blocked["verdict"], blocked["score"]),
+                             ("FAIL", "deny", .7))
+            allowed = next(row for row in rows if row["case"] == "incident-dns-fragment")
+            self.assertEqual((allowed["status"], allowed["verdict"], allowed["score"]),
+                             ("PASS", "allow", .49))
             self.assertTrue(all(req["questions"]["risk"]["type"] == "noul" for req in server.requests))
             self.assertIn(live.EXACT, [req["state"]["args"]["command"] for req in server.requests])
+            report = json.loads(result.stdout)
+            self.assertEqual(report["block_threshold"], .7)
+            self.assertEqual(report["approval_threshold"], .5)
         finally:
             server.shutdown()
             server.server_close()

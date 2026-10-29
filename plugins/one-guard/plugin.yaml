@@ -28,7 +28,12 @@ config_schema:
     description: "Judge deadline in seconds, 0.01 through 120. Hermes hook_callback_timeout must allow enough time."
   threshold:
     type: float
+    default: 0.7
+    description: "Risk score at or above which the call is blocked (probability mode only)."
+  approval_threshold:
+    type: float
     default: 0.5
+    description: "Risk score at or above which the call needs human approval, below the block threshold."
   allow_insecure_http:
     type: bool
     default: false

@@ -2,6 +2,7 @@ import argparse
 import copy
 import contextlib
 import hashlib
+import http.client
 import importlib.util
 import ipaddress
 import io
@@ -9,19 +10,90 @@ import json
 import math
 import os
 from pathlib import Path
+import queue
 import shutil
 import signal
+import socket
+import ssl
 import stat
 import subprocess
 import sys
 import threading
 import tempfile
+import time
+import unicodedata
 from urllib.parse import urlsplit
 
 
 PLUGIN = "one-guard"
 MARKER = ".one-guard-install.json"
 RELEASE = Path(__file__).resolve().parents[1] / "plugins" / PLUGIN
+DISCOVERY_TIMEOUT = 5.0
+MAX_DISCOVERY_BYTES = 65536
+MAX_DISCOVERY_MODELS = 64
+MAX_MODEL_ID_LENGTH = 256
+MANUAL_MODEL = "\x00manual"
+KEEP_MODEL = "\x00keep"
+PROBE_SLOTS = threading.BoundedSemaphore(2)
+# Keep in sync with plugins/one-guard/guard.py DEFAULTS and resolve_thresholds.
+DEFAULT_BLOCK_THRESHOLD = 0.7
+DEFAULT_APPROVAL_THRESHOLD = 0.5
+
+
+def resolve_thresholds(block, approval):
+    """Resolve the effective (block cutoff, approval cutoff) the installer writes.
+
+    ``block`` and ``approval`` are the operator's configured values, or ``None`` when the
+    setting is absent. A configured block cutoff without a configured approval cutoff keeps
+    the legacy two-band behaviour: the approval cutoff follows the block cutoff, so the
+    review band stays empty and the old "allow below, deny at or above" rule is preserved
+    exactly. An approval cutoff above the block cutoff is reduced to the block cutoff, so
+    the block cutoff always wins: that clamp never widens what is allowed and never makes
+    the configuration invalid. Which configured value each cutoff comes from is decided by
+    :func:`threshold_sources`.
+    """
+    block_value = DEFAULT_BLOCK_THRESHOLD if block is None else block
+    if approval is None:
+        approval_value = block_value if block is not None else DEFAULT_APPROVAL_THRESHOLD
+    else:
+        approval_value = approval
+    if type(block_value) in (int, float) and type(approval_value) in (int, float):
+        return block_value, min(approval_value, block_value)
+    return block_value, approval_value
+
+
+def threshold_sources(existing_block, existing_approval, given_block, given_approval):
+    """Choose the configured sources of the block and approval cutoffs.
+
+    ``existing_*`` are the settings already in the configuration, ``given_*`` the values the
+    operator passed on the command line. ``None`` means "not configured".
+
+    An explicit approval cutoff wins. An explicit block cutoff without an explicit approval
+    cutoff returns the review band to the default approval cutoff, so an explicit
+    ``--threshold`` restores the default policy instead of keeping a stale approval cutoff.
+    That reset can widen what is allowed: a configuration whose approval cutoff was below
+    ``0.5`` will now allow the scores between that cutoff and ``0.5`` instead of sending
+    them to the review band. The operator selected the reset by passing an explicit
+    ``--threshold``, and the review screen shows the effective band before anything is
+    written.
+
+    Without an explicit block cutoff the existing settings are kept: an existing approval
+    cutoff stays, and a legacy configuration that only has a block cutoff keeps its exact
+    two-band behaviour with an empty review band.
+    """
+    if given_approval is not None:
+        approval_source = given_approval
+    elif given_block is not None:
+        approval_source = DEFAULT_APPROVAL_THRESHOLD
+    elif existing_approval is not None:
+        approval_source = existing_approval
+    elif existing_block is not None:
+        # A legacy single-threshold configuration keeps its exact two-band behaviour.
+        approval_source = existing_block
+    else:
+        approval_source = None
+    block_source = given_block if given_block is not None else existing_block
+    return block_source, approval_source
 
 
 def _load_sibling(name):
@@ -377,6 +449,8 @@ def merge_config(config, args):
         plugins["enabled"].append(PLUGIN)
     plugins["disabled"] = [item for item in plugins["disabled"] if item != PLUGIN]
     settings = submap(submap(submap(plugins, "entries"), PLUGIN), "settings")
+    existing_block = settings["threshold"] if "threshold" in settings else None
+    existing_approval = settings["approval_threshold"] if "approval_threshold" in settings else None
     if args.protocol is not None:
         settings["protocol"] = args.protocol
     settings.setdefault("protocol", "chat_completions")
@@ -398,6 +472,8 @@ def merge_config(config, args):
         settings["timeout"] = args.timeout
     if getattr(args, "threshold", None) is not None:
         settings["threshold"] = args.threshold
+    if getattr(args, "approval_threshold", None) is not None:
+        settings["approval_threshold"] = args.approval_threshold
     if getattr(args, "insecure_override", None) is not None:
         settings["allow_insecure_http"] = args.insecure_override
     settings.pop("token", None)
@@ -406,15 +482,25 @@ def merge_config(config, args):
             raise InstallError(f"one-guard setting {key} must be a string.")
         if key in settings and any(ord(char) < 32 or ord(char) == 127 or 128 <= ord(char) <= 159 for char in settings[key]):
             raise InstallError(f"one-guard setting {key} cannot contain control characters.")
+    for key in ("endpoint", "judge_model", "mode", "protocol"):
+        if key in settings and has_control_characters(settings[key]):
+            raise InstallError(f"one-guard setting {key} cannot contain control or format characters.")
     if settings["mode"] not in ("yes_no", "probability"):
         raise InstallError("one-guard mode must be yes_no or probability.")
-    for key, low, high in (("timeout", 0.01, 120.0), ("threshold", 0.0, 1.0)):
+    for key, low, high in (("timeout", 0.01, 120.0), ("threshold", 0.0, 1.0),
+                           ("approval_threshold", 0.0, 1.0)):
         if key in settings:
             value = settings[key]
             if type(value) not in (int, float) or not low <= value <= high or not math.isfinite(value):
                 raise InstallError(f"one-guard {key} must be a finite number between {low} and {high}.")
     if "allow_insecure_http" in settings and type(settings["allow_insecure_http"]) is not bool:
         raise InstallError("one-guard allow_insecure_http must be a boolean.")
+    block_source, approval_source = threshold_sources(
+        existing_block, existing_approval,
+        getattr(args, "threshold", None), getattr(args, "approval_threshold", None))
+    block, approval = resolve_thresholds(block_source, approval_source)
+    settings["threshold"] = block
+    settings["approval_threshold"] = approval
     try:
         endpoint = urlsplit(settings["endpoint"])
         valid = endpoint.scheme in ("http", "https") and endpoint.hostname and endpoint.username is None and endpoint.password is None and not endpoint.fragment and not endpoint.query and endpoint.path == path
@@ -434,6 +520,266 @@ def merge_config(config, args):
     return config
 
 
+def strict_json(text):
+    def reject(*args):
+        raise ValueError("Invalid JSON value")
+
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError("Duplicate JSON key")
+            result[key] = value
+        return result
+
+    return json.loads(text, object_pairs_hook=pairs, parse_constant=reject)
+
+
+def has_control_characters(value):
+    """True when the text holds any Unicode control, format, or other C-category character."""
+    return any(unicodedata.category(char).startswith("C") for char in value)
+
+
+def leaks_credential(value, credential):
+    """True when the credential appears anywhere inside the value."""
+    if not isinstance(value, str) or not isinstance(credential, str) or not credential:
+        return False
+    return credential in value
+
+
+def is_loopback_host(host):
+    """True only for a literal loopback address such as 127.0.0.1 or ::1."""
+    if not isinstance(host, str):
+        return False
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def remaining_time(deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("Deadline expired")
+    return remaining
+
+
+class DeadlineReader(io.RawIOBase):
+    def __init__(self, sock, deadline):
+        self.sock = sock
+        self.deadline = deadline
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        self.sock.settimeout(remaining_time(self.deadline))
+        return self.sock.recv_into(buffer)
+
+
+class DeadlineSocket:
+    def __init__(self, sock, deadline):
+        self.sock = sock
+        self.deadline = deadline
+
+    def makefile(self, mode):
+        return io.BufferedReader(DeadlineReader(self.sock, self.deadline))
+
+    def sendall(self, data):
+        self.sock.settimeout(remaining_time(self.deadline))
+        self.sock.sendall(data)
+
+    def close(self):
+        pass
+
+
+class DeadlineConnection(http.client.HTTPConnection):
+    def __init__(self, host, port, deadline, secure):
+        self.default_port = 443 if secure else 80
+        super().__init__(host, port)
+        self.deadline = deadline
+        self.secure = secure
+        self.transport = None
+
+    def connect(self):
+        addresses = socket.getaddrinfo(self.host, self.port, 0, socket.SOCK_STREAM)
+        for index, (family, kind, proto, _, address) in enumerate(addresses):
+            sock = socket.socket(family, kind, proto)
+            self.transport = sock
+            try:
+                sock.settimeout(remaining_time(self.deadline))
+                sock.connect(address)
+                if self.secure:
+                    context = ssl.create_default_context()
+                    sock.settimeout(remaining_time(self.deadline))
+                    sock = context.wrap_socket(sock, server_hostname=self.host)
+                    self.transport = sock
+                remaining_time(self.deadline)
+                self.sock = DeadlineSocket(sock, self.deadline)
+                return
+            except Exception:
+                sock.close()
+                if index == len(addresses) - 1:
+                    raise
+        raise OSError("Judge address unavailable")
+
+
+def fetch_model_list(url, token, deadline):
+    """One GET to /v1/models on the endpoint origin. Returns the raw body."""
+    port = url.port or (443 if url.scheme == "https" else 80)
+    connection = DeadlineConnection(url.hostname, port, deadline, url.scheme == "https")
+    response = None
+    try:
+        headers = {"Accept": "application/json"}
+        if token:
+            headers["Authorization"] = "Bearer " + token
+        connection.request("GET", "/v1/models", headers=headers)
+        response = connection.getresponse()
+        if response.status != 200:
+            raise ValueError("Unexpected status")
+        if response.getheader("Content-Encoding", "identity") != "identity":
+            raise ValueError("Unexpected encoding")
+        length = response.getheader("Content-Length")
+        if length is not None and (not length.isascii() or not length.isdecimal()
+                                   or int(length) > MAX_DISCOVERY_BYTES):
+            raise ValueError("Oversized response")
+        raw = response.read(MAX_DISCOVERY_BYTES + 1)
+        if len(raw) > MAX_DISCOVERY_BYTES:
+            raise ValueError("Oversized response")
+        return raw
+    finally:
+        if response is not None:
+            response.close()
+        connection.close()
+        if connection.transport is not None:
+            connection.transport.close()
+
+
+def native_modalities(item):
+    """True when the server reports native decisions, False for text only, None if unknown.
+
+    The metadata is matched exactly: `decisions` is claimed when the server lists that
+    exact value, and text-only output is claimed only for the exact single-element list
+    `["text"]`. Every other combination, and any malformed value, is unknown.
+    """
+    architecture = item.get("architecture")
+    if not isinstance(architecture, dict):
+        return None
+    modalities = architecture.get("output_modalities")
+    if not isinstance(modalities, list) or not modalities:
+        return None
+    if any(not isinstance(value, str) for value in modalities):
+        return None
+    if "decisions" in modalities:
+        return True
+    if modalities == ["text"]:
+        return False
+    return None
+
+
+def parse_model_list(raw, credential=None):
+    """Return {"entries": [...], "truncated": bool} or None when the body is unusable."""
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeError:
+        return None
+    try:
+        payload = strict_json(text)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    data = payload.get("data")
+    if not isinstance(data, list):
+        return None
+    entries = []
+    seen = set()
+    candidates = 0
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        identifier = item.get("id")
+        if not isinstance(identifier, str):
+            continue
+        identifier = identifier.strip()
+        if not identifier or len(identifier) > MAX_MODEL_ID_LENGTH:
+            continue
+        if has_control_characters(identifier):
+            continue
+        if leaks_credential(identifier, credential):
+            continue
+        if identifier in seen:
+            continue
+        seen.add(identifier)
+        candidates += 1
+        if len(entries) < MAX_DISCOVERY_MODELS:
+            entries.append({"id": identifier, "native": native_modalities(item)})
+    return {"entries": entries, "truncated": candidates > MAX_DISCOVERY_MODELS}
+
+
+def probe_models(endpoint, token, timeout=DISCOVERY_TIMEOUT):
+    """Ask the judge for its model list. Returns a parsed result or None; never raises.
+
+    The credential is threaded into the parser so identifiers that carry it are dropped
+    before the identifier limit and the truncation flag are computed.
+    """
+    if not isinstance(endpoint, str):
+        return None
+    url = urlsplit(endpoint)
+    if url.scheme not in ("http", "https") or not url.hostname:
+        return None
+    deadline = time.monotonic() + timeout
+    if not PROBE_SLOTS.acquire(timeout=max(0.0, deadline - time.monotonic())):
+        return None
+    result = queue.Queue(maxsize=1)
+
+    def run():
+        try:
+            result.put(("ok", fetch_model_list(url, token, deadline)))
+        except Exception:
+            result.put(("error", None))
+        finally:
+            PROBE_SLOTS.release()
+
+    worker = threading.Thread(target=run, daemon=True, name="one-guard-model-probe")
+    try:
+        worker.start()
+    except Exception:
+        PROBE_SLOTS.release()
+        return None
+    try:
+        kind, payload = result.get(timeout=max(0.0, deadline - time.monotonic()))
+    except queue.Empty:
+        return None
+    if kind != "ok":
+        return None
+    return parse_model_list(payload, token)
+
+
+def probe_origin(endpoint):
+    if not isinstance(endpoint, str):
+        return None
+    url = urlsplit(endpoint)
+    if url.scheme not in ("http", "https") or not url.hostname:
+        return None
+    host = url.hostname
+    if ":" in host:
+        host = "[" + host + "]"
+    default = 443 if url.scheme == "https" else 80
+    port = url.port
+    return f"{url.scheme}://{host}" + (f":{port}" if port and port != default else "")
+
+
+def model_label(entry, protocol):
+    if protocol != "systemone":
+        return "compatibility not declared by the server"
+    if entry["native"] is True:
+        return "native decisions reported by the server"
+    if entry["native"] is False:
+        return "text only per server metadata"
+    return "capability not reported by the server"
+
+
 def warn_hook_budget(config):
     plugins = config["plugins"]
     timeout = plugins["entries"][PLUGIN]["settings"].get("timeout", 5.0)
@@ -448,6 +794,30 @@ def warn_hook_budget(config):
               f"by the Hermes host hook timeout ({budget:g}s). Set plugins.hook_callback_timeout "
               f">= {timeout + 5:g} seconds (timeout + 5), or appropriately higher for your host. "
               "The installer has not changed this global setting.", file=sys.stderr)
+
+
+def _band_number(value, fallback):
+    if type(value) not in (int, float) or not math.isfinite(value):
+        return fallback
+    return value
+
+
+def risk_band_summary(config):
+    """Describe the effective risk band of a configuration.
+
+    The line carries the two cutoffs only. It holds no tool data, no credential, and no
+    judge response body.
+    """
+    plugins = config.get("plugins") or {}
+    entries = plugins.get("entries") or {}
+    entry = entries.get(PLUGIN) or {}
+    settings = entry.get("settings") or {}
+    if settings.get("mode", "yes_no") != "probability":
+        return "Risk band: not used in yes/no mode"
+    block = _band_number(settings.get("threshold"), DEFAULT_BLOCK_THRESHOLD)
+    approval = _band_number(settings.get("approval_threshold"), DEFAULT_APPROVAL_THRESHOLD)
+    return (f"Risk band: allow below {approval:g}, review {approval:g} to {block:g}, "
+            f"block at {block:g} and above")
 
 
 def prepare_config(home, args, token, yaml, clear_token=False):
@@ -626,20 +996,30 @@ def judge_defaults(args, settings):
     def value(option, key, fallback):
         given = getattr(args, option, None)
         return settings.get(key, fallback) if given is None else given
+    existing_block = settings["threshold"] if "threshold" in settings else None
+    existing_approval = settings["approval_threshold"] if "approval_threshold" in settings else None
+    block, approval = resolve_thresholds(*threshold_sources(
+        existing_block, existing_approval,
+        getattr(args, "threshold", None), getattr(args, "approval_threshold", None)))
+    if type(block) not in (int, float):
+        block = DEFAULT_BLOCK_THRESHOLD
+    if type(approval) not in (int, float):
+        approval = DEFAULT_APPROVAL_THRESHOLD
     return {
         "protocol": value("protocol", "protocol", "chat_completions"),
         "endpoint": value("endpoint", "endpoint", None),
         "model": value("model", "judge_model", ""),
         "mode": value("response_mode", "mode", "yes_no"),
         "timeout": value("timeout", "timeout", 5),
-        "threshold": value("threshold", "threshold", 0.5),
+        "threshold": block,
+        "approval_threshold": approval,
     }
 
 
 def trial_args(**overrides):
     base = {"protocol": None, "endpoint": None, "allow_insecure_http": False,
             "insecure_override": None, "model": None, "timeout": None,
-            "threshold": None, "response_mode": None}
+            "threshold": None, "approval_threshold": None, "response_mode": None}
     base.update(overrides)
     return argparse.Namespace(**base)
 
@@ -672,15 +1052,6 @@ def configure_judge(ui, args, settings):
         return value
 
     args.endpoint = ui.text("Judge endpoint", endpoint_default, validate=endpoint)
-    model_default = defaults["model"]
-
-    def model(value):
-        merge_config({}, trial_args(protocol=args.protocol, endpoint=args.endpoint,
-                                    insecure_override=args.insecure_override, model=value))
-        return value
-
-    ui.say("Leave the model blank when your endpoint selects one by itself; multi-model routers usually need a model identifier.")
-    args.model = ui.text("Judge model", model_default, validate=model)
     ui.header("04 / Decision policy",
               "Uncertain, malformed, or unreachable judgments block the tool call.")
     args.response_mode = ui.choose("Response mode",
@@ -692,11 +1063,17 @@ def configure_judge(ui, args, settings):
     args.timeout = ui.text("Timeout in seconds", defaults["timeout"],
                            validate=lambda value: number_field(value, 0.01, 120))
     if args.response_mode == "probability":
-        ui.say("A call is allowed only when the risk score is strictly below the threshold.")
-        args.threshold = ui.text("Risk threshold", defaults["threshold"],
+        ui.say("Below the approval threshold a call runs. Inside the review band it needs "
+               "your approval. At or above the block threshold it is blocked.")
+        args.approval_threshold = ui.text("Approval threshold (review band starts here)",
+                                           defaults["approval_threshold"],
+                                           validate=lambda value: number_field(value, 0, 1))
+        args.threshold = ui.text("Block threshold (blocked at or above)",
+                                 defaults["threshold"],
                                  validate=lambda value: number_field(value, 0, 1))
     else:
         args.threshold = None
+        args.approval_threshold = None
 
 
 def configure_auth(ui, token, settings, home):
@@ -723,6 +1100,124 @@ def configure_auth(ui, token, settings, home):
     return token, False
 
 
+def effective_credential(home, args, token, yaml, clear_token=False):
+    """The credential this installation would store, read back from the merged .env.
+
+    Hermes resolves its credential at runtime from its own profile and environment, so
+    this is not necessarily the credential the plugin will send. Resolution failures
+    propagate; None means a successfully resolved absence, not an unknown credential.
+    """
+    _, env_bytes = prepare_config(home, args, token, yaml, clear_token=clear_token)
+    from dotenv import dotenv_values
+    values = dotenv_values(stream=io.StringIO(env_bytes.decode("utf-8-sig")), interpolate=False)
+    return values.get("ONE_GUARD_TOKEN")
+
+
+def configure_model(ui, args, settings, home, token, yaml, clear_token=False):
+    ui.header("06 / Model discovery",
+              "Optional. Ask the judge which models it serves, or name one yourself.")
+    default = judge_defaults(args, settings)["model"]
+    if not isinstance(default, str):
+        default = ""
+
+    def model(value):
+        merge_config({}, trial_args(protocol=args.protocol, endpoint=args.endpoint,
+                                    insecure_override=args.insecure_override, model=value))
+        return value
+
+    ui.say("Leave the model blank when your endpoint selects one by itself; multi-model "
+           "routers usually need a model identifier.")
+    try:
+        credential = effective_credential(home, args, token, yaml, clear_token)
+    except (InstallError, OSError):
+        ui.say("Discovery skipped: the installer could not determine the selected credential. "
+               "Enter the model manually or leave it blank for the endpoint default. "
+               "Configuration and credential errors must be fixed before installation.")
+        # An unresolved credential cannot be redacted from an existing model default.
+        args.model = ui.text("Judge model", "", validate=model)
+        return
+    if credential:
+        ui.secrets.append(credential)
+    origin = probe_origin(args.endpoint)
+    if origin is None:
+        ui.say("This endpoint cannot be probed for a model list.")
+        args.model = ui.text("Judge model", default, validate=model)
+        return
+    shown = installer_ui.safe_text(origin)
+    url = urlsplit(args.endpoint)
+    plaintext_remote = url.scheme == "http" and not is_loopback_host(url.hostname)
+    ui.say(f"Discovery sends one GET request to {shown}/v1/models and nothing else.")
+    if credential:
+        ui.say("The bearer credential selected by this installer is sent to that host with "
+               "that request. Hermes may resolve a different credential at runtime from its "
+               "active profile or environment.")
+        if plaintext_remote:
+            ui.say("That endpoint is remote plaintext HTTP, so the credential travels "
+                   "unencrypted and can be read on the network.")
+    else:
+        ui.say("No credential is selected, so the request carries no authorization header.")
+        if plaintext_remote:
+            ui.say("That endpoint is remote plaintext HTTP, so the model-list request is "
+                   "visible to anyone on the network.")
+    consent = ui.choose("Ask the judge for its model list?",
+                        [(False, "No - skip the probe and name the model"),
+                         (True, f"Yes - probe {shown} once")], 0)
+    if not consent:
+        args.model = ui.text("Judge model", default, validate=model)
+        return
+    ui.say(f"Contacting {shown}...")
+    result = probe_models(args.endpoint, credential)
+    if result is None:
+        ui.say("The model list could not be read. The judge may be offline or may not serve "
+               "/v1/models. Name the model identifier instead.")
+        args.model = ui.text("Judge model", default, validate=model)
+        return
+    entries = result["entries"]
+    if credential:
+        entries = [entry for entry in entries if not leaks_credential(entry["id"], credential)]
+    if not entries:
+        ui.say("The judge returned no usable model identifiers. Name the model identifier instead.")
+        args.model = ui.text("Judge model", default, validate=model)
+        return
+    ui.say("These identifiers come from the judge. The notes are the judge's own metadata; "
+           "One Guard does not verify them, and it loads no model itself.")
+    if result["truncated"]:
+        ui.say(f"The judge listed more models than this probe shows; only the first "
+               f"{MAX_DISCOVERY_MODELS} identifiers are listed, and this probe does not follow "
+               "pagination.")
+    else:
+        ui.say("Only the identifiers in this one response are shown; this probe does not follow "
+               "pagination.")
+    default_unsafe = leaks_credential(default, credential)
+    choices = []
+    for entry in entries:
+        choices.append((entry["id"], f"{entry['id']}  ·  {model_label(entry, args.protocol)}"))
+    choices.append((MANUAL_MODEL, "Name a model identifier manually"))
+    if default_unsafe:
+        choices.append((KEEP_MODEL, "Leave blank - the endpoint selects the model"))
+    else:
+        choices.append((KEEP_MODEL, f"Keep the current model ({default})" if default
+                        else "Leave blank - the endpoint selects the model"))
+    selected = len(choices) - 1
+    for position, entry in enumerate(entries):
+        if entry["id"] == default:
+            selected = position
+            break
+    answer = ui.choose("Which model should One Guard use?", choices, selected)
+    if answer == MANUAL_MODEL:
+        args.model = ui.text("Judge model", default, validate=model)
+        if leaks_credential(args.model, credential):
+            ui.say("That identifier contains the bearer credential and will be written to "
+                   "config.yaml.")
+    elif answer == KEEP_MODEL:
+        args.model = "" if default_unsafe else default
+    elif leaks_credential(answer, credential):
+        raise InstallError("Refusing to store a judge model identifier that contains the "
+                           "bearer credential.")
+    else:
+        args.model = model(answer)
+
+
 def run_wizard(ui, args, source, yaml):
     token = os.environ.get("ONE_GUARD_TOKEN")
     if token:
@@ -731,6 +1226,7 @@ def run_wizard(ui, args, source, yaml):
     home = None
     section = "all"
     clear_token = False
+    model_stale = False
     while True:
         if section in ("all", "home"):
             ui.header("02 / Hermes data home",
@@ -739,9 +1235,15 @@ def run_wizard(ui, args, source, yaml):
             home_default = str(home)
         settings = current_settings(home, yaml)
         if section in ("all", "judge"):
+            before = (args.endpoint, args.protocol)
             configure_judge(ui, args, settings)
+            if section == "judge" and (args.endpoint, args.protocol) != before:
+                model_stale = True
         if section in ("all", "auth"):
             token, clear_token = configure_auth(ui, token, settings, home)
+        if section in ("all", "model") or model_stale:
+            configure_model(ui, args, settings, home, token, yaml, clear_token)
+            model_stale = False
         if section == "source":
             source = choose_source(ui)
         try:
@@ -752,6 +1254,7 @@ def run_wizard(ui, args, source, yaml):
             section = ui.choose("What now?",
                                 [("cancel", "Cancel — write nothing"),
                                  ("judge", "Change the judge settings"),
+                                 ("model", "Change the judge model"),
                                  ("home", "Change the destination")])
             if section == "cancel":
                 raise Cancelled("Installation cancelled. No Hermes files were written.")
@@ -763,7 +1266,9 @@ def run_wizard(ui, args, source, yaml):
                                    interpolate=False).get("ONE_GUARD_TOKEN")
         if credential:
             ui.secrets.append(credential)
-        ui.header("06 / Review", "Nothing has been written yet. Confirm to install.")
+        ui.header("07 / Review", "Nothing has been written yet. Confirm to install.")
+        approval = effective.get("approval_threshold", DEFAULT_APPROVAL_THRESHOLD)
+        block = effective.get("threshold", DEFAULT_BLOCK_THRESHOLD)
         ui.summary([
             ("Hermes source", source),
             ("Data home", home),
@@ -773,11 +1278,16 @@ def run_wizard(ui, args, source, yaml):
             ("Model", effective.get("judge_model") or "endpoint default"),
             ("Mode", effective["mode"]),
             ("Timeout", f"{effective.get('timeout', 5):g}s"),
-            ("Risk threshold", f"{effective.get('threshold', 0.5):g}"
+            ("Risk band", f"allow below {approval:g}, review {approval:g} to {block:g}, "
+                          f"block at {block:g} and above"
              if effective["mode"] == "probability" else "not used in yes/no mode"),
             ("Plaintext HTTP", "allowed" if effective.get("allow_insecure_http") else "disabled"),
             ("Credential", "present" if credential else "absent"),
         ])
+        if credential:
+            ui.say("Credential: this installer stores one in the Hermes .env. Hermes resolves "
+                   "the runtime credential from its own profile and environment, which can "
+                   "differ.")
         if effective.get("prompt"):
             ui.say("Custom prompt: kept as configured (trusted advanced instructions).")
         if any(key.startswith("ONE_GUARD_") and key not in ("ONE_GUARD_TOKEN", "ONE_GUARD_INSTALL_REEXEC")
@@ -795,6 +1305,7 @@ def run_wizard(ui, args, source, yaml):
             return source, home, token, clear_token
         section = ui.choose("Change what?",
                             [("judge", "Judge connection and decision policy"),
+                             ("model", "Judge model"),
                              ("auth", "Authentication"),
                              ("home", "Hermes data home"),
                              ("source", "Hermes source"),
@@ -817,7 +1328,8 @@ def parser():
     result.add_argument("--allow-insecure-http", action="store_true", help="Explicitly permit non-loopback HTTP, including a LAN judge")
     result.add_argument("--model", help="Judge model identifier")
     result.add_argument("--timeout", type=float, help="Judge deadline in seconds, 0.01 through 120 (default: preserve existing setting or runtime default 5)")
-    result.add_argument("--threshold", type=float, help="Risk threshold, 0 through 1 (default: preserve existing setting or runtime default 0.5)")
+    result.add_argument("--threshold", type=float, help="Risk score at or above which the call is blocked, 0 through 1 (default: preserve existing setting or runtime default 0.7; passing it returns the review band to the default approval cutoff 0.5, which allows the scores that a lower configured approval cutoff would have reviewed)")
+    result.add_argument("--approval-threshold", type=float, help="Risk score at or above which the call needs human approval, 0 through 1 (default: preserve existing setting, or 0.5 when --threshold is passed without it); a value above the block threshold is reduced to the block threshold, not rejected")
     result.add_argument("--response-mode", choices=("yes_no", "probability"))
     return result
 
@@ -909,7 +1421,9 @@ def _main(argv, stack):
                      "Restart Hermes to load one-guard."):
             print(ui.clean(line) if ui else installer_ui.safe_text(line))
         if args.yes:
-            warn_hook_budget(parse_config(serialized, yaml))
+            installed = parse_config(serialized, yaml)
+            warn_hook_budget(installed)
+            print(installer_ui.safe_text(risk_band_summary(installed)))
         return 0
     except InterpreterResult as exc:
         return exc.args[0]

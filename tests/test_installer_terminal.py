@@ -1,3 +1,5 @@
+import http.server
+import json
 import os
 import pty
 import re
@@ -5,6 +7,7 @@ import select
 import signal
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -15,8 +18,50 @@ ARTIFACTS = ROOT / ".test-artifacts"
 ANSI = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
 
 
+class StubJudge:
+    """A loopback judge that answers GET /v1/models with a fixed model list."""
+
+    def __init__(self, models=("model-a", "model-b")):
+        self.requests = []
+        self.models = list(models)
+        judge = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                judge.requests.append({"path": self.path, "headers": dict(self.headers)})
+                body = json.dumps({"data": [{"id": name} for name in judge.models]}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                try:
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            def log_message(self, *args):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    @property
+    def endpoint(self):
+        host, port = self.server.server_address[:2]
+        return f"http://{host}:{port}/v1/chat/completions"
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+
+
 class Terminal:
-    def __init__(self, root, source, release, bootstrap=False, fail=False):
+    def __init__(self, root, source, release, bootstrap=False, fail=False, extra=()):
         self.root = root
         environment = dict(os.environ)
         environment.update({"HOME": str(root), "HERMES_HOME": str(root / "data"),
@@ -45,7 +90,8 @@ class Terminal:
             f"m.RELEASE = pathlib.Path({str(release)!r})\n"
             + stub
             + ("sys.exit(m.main([]))\n" if bootstrap else
-               f"sys.exit(m.main(['--hermes-dir', {str(source)!r}]))\n"))
+               f"sys.exit(m.main(['--hermes-dir', {str(source)!r}"
+               + (", " + ", ".join(repr(item) for item in extra) if extra else "") + "]))\n"))
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
             os.chdir(root)
@@ -67,25 +113,61 @@ class Terminal:
 
     def send(self, data, wait=1.0):
         for byte in data:
-            os.write(self.fd, bytes([byte]))
+            try:
+                os.write(self.fd, bytes([byte]))
+            except OSError:
+                return
             time.sleep(0.015)
         self.pump(wait)
 
     def close(self):
+        """Clean up the child and the pty without blocking the suite."""
         try:
             os.close(self.fd)
         except OSError:
             pass
-        try:
-            os.waitpid(self.pid, 0)
-        except ChildProcessError:
-            pass
+        if self.reap(5.0):
+            return
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.kill(self.pid, sig)
+            except ProcessLookupError:
+                return
+            if self.reap(5.0):
+                return
 
-    def exit_code(self):
-        pid, status = os.waitpid(self.pid, os.WNOHANG)
-        if not pid:
-            raise AssertionError("installer parent did not exit")
-        return os.waitstatus_to_exitcode(status)
+    def reap(self, timeout):
+        """Wait up to ``timeout`` seconds for the child, then reap it. True when reaped."""
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                pid, _ = os.waitpid(self.pid, os.WNOHANG)
+            except ChildProcessError:
+                return True
+            if pid:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+
+    def exit_code(self, timeout=30.0):
+        """Wait for the installer parent to exit and return its exit status.
+
+        The parent can still be winding down when the test asks for its status, so poll
+        within a bounded deadline instead of asserting on the first ``waitpid`` attempt.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                pid, status = os.waitpid(self.pid, os.WNOHANG)
+            except ChildProcessError:
+                raise AssertionError("installer parent was already reaped")
+            if pid:
+                return os.waitstatus_to_exitcode(status)
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    f"installer parent did not exit within {timeout:g}s")
+            time.sleep(0.05)
 
 
 class TerminalWizardTests(unittest.TestCase):
@@ -105,8 +187,8 @@ class TerminalWizardTests(unittest.TestCase):
         (self.release / "plugin.yaml").write_text("name: one-guard\n")
         (self.release / "__init__.py").write_text("VERSION = 1\n")
 
-    def start(self):
-        terminal = Terminal(self.root, self.source, self.release)
+    def start(self, extra=()):
+        terminal = Terminal(self.root, self.source, self.release, extra=extra)
         self.addCleanup(terminal.close)
         terminal.pump(2.5)
         return terminal
@@ -203,12 +285,14 @@ class TerminalWizardTests(unittest.TestCase):
         terminal.send(b"\x1b[B", 0.7)
         terminal.send(b"\r", 1.0)
         terminal.send(b"http://192.0.2.1:9292/v1/systemone\r", 1.6)
-        terminal.send(b"h2o-lightning-4b\r", 1.4)
         terminal.send(b"\x1b[B", 0.7)
         terminal.send(b"\r", 1.0)
         terminal.send(b"60\r", 1.2)
         terminal.send(b"0.5\r", 1.2)
+        terminal.send(b"\r", 1.2)
         terminal.send(b"\r", 1.4)
+        terminal.send(b"\r", 1.4)
+        terminal.send(b"h2o-lightning-4b\r", 1.4)
         terminal.send(b"\r", 2.5)
         import yaml
         settings = yaml.safe_load((self.root / "data/config.yaml").read_text())["plugins"]["entries"]["one-guard"]["settings"]
@@ -217,6 +301,58 @@ class TerminalWizardTests(unittest.TestCase):
         self.assertEqual(settings["judge_model"], "h2o-lightning-4b")
         self.assertEqual(settings["timeout"], 60)
         self.assertTrue(settings["allow_insecure_http"])
+        self.assertEqual(settings["approval_threshold"], 0.5)
+        self.assertEqual(settings["threshold"], 0.7)
+
+    def test_invalid_existing_model_skips_discovery_and_is_repaired_in_the_terminal(self):
+        import yaml
+        credential = "synthetic-file-secret"
+        home = self.root / "data"
+        home.mkdir()
+        (home / ".env").write_text(f'ONE_GUARD_TOKEN="{credential}"\n')
+        (home / "config.yaml").write_text(yaml.safe_dump({"plugins": {
+            "enabled": [], "entries": {"one-guard": {
+                "settings": {"judge_model": f"model-{credential}\u202e"}}}}}))
+        judge = StubJudge(models=(f"model-{credential}",))
+        self.addCleanup(judge.close)
+        terminal = self.start(extra=["--endpoint", judge.endpoint])
+        for _ in range(7):
+            terminal.send(b"\r", 1.4)
+        self.assertIn("Discovery skipped", terminal.transcript)
+        self.assertNotIn(credential, terminal.transcript)
+        self.assertEqual(judge.requests, [])
+        terminal.send(b"typed-model\r", 1.4)
+        terminal.send(b"\r", 2.5)
+        self.assertEqual(terminal.exit_code(), 0)
+        settings = yaml.safe_load((home / "config.yaml").read_text())["plugins"]["entries"]["one-guard"]["settings"]
+        self.assertEqual(settings["judge_model"], "typed-model")
+        self.assertNotIn(credential, terminal.transcript)
+        self.assertEqual(judge.requests, [])
+
+    def test_model_discovery_lists_the_judge_models_and_arrow_selects_one(self):
+        judge = StubJudge()
+        self.addCleanup(judge.close)
+        terminal = self.start(extra=["--endpoint", judge.endpoint])
+        terminal.send(b"\r", 1.2)
+        terminal.send(b"\r", 1.0)
+        terminal.send(b"\r", 1.0)
+        terminal.send(b"\r", 1.4)
+        terminal.send(b"\r", 1.0)
+        terminal.send(b"\r", 1.2)
+        terminal.send(b"\r", 1.4)
+        terminal.send(b"\x1b[B", 0.6)
+        terminal.send(b"\r", 1.8)
+        self.assertEqual([request["path"] for request in judge.requests], ["/v1/models"])
+        self.assertIn("model-a", terminal.transcript)
+        self.assertIn("model-b", terminal.transcript)
+        terminal.send(b"\x1b[A", 0.4)
+        terminal.send(b"\x1b[A", 0.4)
+        terminal.send(b"\r", 1.4)
+        terminal.send(b"\r", 2.5)
+        import yaml
+        settings = yaml.safe_load((self.root / "data/config.yaml").read_text())["plugins"]["entries"]["one-guard"]["settings"]
+        self.assertEqual(settings["judge_model"], "model-b")
+        self.assertEqual(settings["endpoint"], judge.endpoint)
 
     def test_consent_bootstrap_then_arrow_wizard(self):
         terminal = Terminal(self.root, self.source, self.release, bootstrap=True)
@@ -237,11 +373,14 @@ class TerminalWizardTests(unittest.TestCase):
         terminal.send(b"\x1b[B", 0.7)
         terminal.send(b"\r", 1.0)
         terminal.send(b"\r", 1.0)
+        terminal.send(b"\r", 1.0)
         terminal.send(b"\r", 1.2)
         terminal.send(b"\r", 1.2)
         terminal.send(b"\r", 1.2)
         terminal.send(b"\r", 1.2)
         terminal.send(b"\r", 1.2)
+        terminal.send(b"\r", 1.2)
+        terminal.send(b"\r", 2.5)
         terminal.send(b"\r", 2.5)
         import yaml
         settings = yaml.safe_load((self.root / "data/config.yaml").read_text())["plugins"]["entries"]["one-guard"]["settings"]
@@ -254,11 +393,13 @@ class TerminalWizardTests(unittest.TestCase):
         terminal.send(b"\r", 1.0)
         terminal.send(b"\r", 1.0)
         terminal.send(b"\r", 1.4)
+        terminal.send(b"\r", 1.0)
+        terminal.send(b"\r", 1.2)
         terminal.send(b"\r", 1.4)
         terminal.send(b"\r", 1.4)
         terminal.send(b"\r", 1.4)
         terminal.send(b"\r", 2.5)
-        self.assertIn("06 / Review", terminal.transcript)
+        self.assertIn("07 / Review", terminal.transcript)
         self.assertIn("Protocol", terminal.transcript)
         self.assertIn("chat_completions", terminal.transcript)
         self.assertIn("Credential", terminal.transcript)

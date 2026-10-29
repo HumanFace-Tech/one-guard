@@ -1,5 +1,274 @@
 # Hermes integration verification
 
+## Three-band policy verification
+
+The probability policy now has three bands: allow below `approval_threshold`, request host
+approval from `approval_threshold` up to `threshold`, and deny at or above `threshold`. The
+defaults are `0.5` and `0.7`. Yes/no mode is unchanged.
+
+Verified on 2026-10-29 against Hermes source at
+`e5f2b15300a3d04978e4c07cc64adc7bcf8e7b1c`, using CPython 3.11.10 on Linux. The run was
+**205 tests passed, no skips, in 199.105 seconds**, plus
+`python3 -m compileall -q plugins/one-guard scripts tests` and `sh -n scripts/verify-hermes.sh`.
+The interpreter was a temporary virtual environment with `ruamel.yaml`, `packaging`,
+`requests`, `psutil`, `PyYAML`, `python-dotenv`, `prompt_toolkit`, `wcwidth`, and
+`cryptography`; no Hermes installation, model, or inference service was involved, and no
+request was made to a live judge.
+
+What the new tests establish:
+
+- The band edges are exact. `0.49` runs, `0.5` asks for approval, `0.69` asks for
+  approval, `0.7` is blocked, and `1` is blocked, for both the chat-completions number and
+  the native `noul` answer (`tests/test_guard.py`,
+  `test_probability_review_band_directive_and_edges`).
+- The directive reaches the real Hermes dispatcher: the plugin returns
+  `{"action": "approve", ...}` and `get_pre_tool_call_directive` reports `approve` for a
+  mid-band score, `None` below the approval cutoff, and `block` at the block cutoff.
+- The message carries the score and the band and carries no tool arguments: the test
+  asserts that the proposal's `exfil.invalid` destination and its synthetic secret are
+  absent from it.
+- The real Hermes approval gate resolves the directive. With a registered CLI approval
+  callback, `once` runs the tool, `deny` blocks it with `BLOCKED`, and `timeout` blocks it
+  with `BLOCKED`. With no human present the call is blocked, because Hermes fails closed
+  for a plugin-flagged action nobody can answer.
+- A remembered `session` answer approves the same proposal without a second prompt. The
+  plugin sets its own `rule_key`, so the host's allowlist grain is that proposal and not the
+  bare tool name. See [the approval rule key verification](#approval-rule-key-verification).
+- The host's own bypasses apply and are the host's policy: with `approvals.mode: off` in
+  `config.yaml`, and with the session YOLO toggle enabled, the same mid-band call runs
+  without a prompt. One Guard cannot override that from a plugin callback, and the
+  operator accepts it.
+- Yes/no mode never asks for approval: `no` runs, `yes` is blocked.
+- Malformed responses, transport failures, and invalid configuration still block, and the
+  invalid-configuration message contains no credential.
+- Legacy threshold semantics survive. A configured `threshold` without a configured
+  `approval_threshold` keeps the empty review band for every legacy value, so `0.3` still
+  blocks at `0.3` and `0.9` still blocks at `0.9`. An approval cutoff above the block
+  cutoff is reduced to the block cutoff. The installer resolves thresholds with the same
+  function as the runtime, which a matrix test compares across both implementations.
+
+These are stub and dispatcher results. They do not establish judge efficacy, calibration,
+or prompt-injection resistance, and they do not establish anything about a live judge. The
+live observations recorded below predate the three-band policy and used the single
+threshold `0.5`; they were not re-run.
+
+## Approval rule key verification
+
+A source review of the pinned Hermes revision found that the review band's approval grain
+was not what the project documentation claimed. `hermes_cli/plugins.py:2005` calls
+`tools.approval.request_tool_approval(tool_name, message, rule_key=details.rule_key or
+tool_name)`, so a plugin that returns no `rule_key` is keyed by the bare tool name. The
+reason-hash default inside `request_tool_approval` is unreachable from that call site,
+because the dispatcher substitutes the tool name before the call. A remembered answer
+therefore covered every later escalation of that tool name, whatever the arguments were
+and whichever plugin asked for the approval.
+
+The plugin now returns an explicit `rule_key`: a namespaced `one-guard:<sha256>` digest
+over the full validated bounded `{tool_name, args}` proposal. Verified on 2026-10-29
+against Hermes source at `e5f2b15300a3d04978e4c07cc64adc7bcf8e7b1c`, using CPython
+3.11.10 on Linux. The full suite reported **214 tests passed, no skips, in 203.087
+seconds**; the five tests added for this change are the ones listed here. The run
+included no request to a live judge, no Hermes installation, and no model or inference
+service.
+
+Commands:
+
+```sh
+HERMES_SOURCE=/path/to/hermes-source python3 -m unittest discover -s tests -p 'test_*.py' -v
+python3 -m compileall -q plugins/one-guard scripts tests
+sh -n scripts/verify-hermes.sh
+```
+
+What the new tests establish:
+
+- The rule key is namespaced, opaque, and stable. The same proposal yields the same key
+  whatever order its arguments were built in; a different proposal and a different tool
+  yield different keys. The key contains no raw argument, no tool name, and no credential
+  (`tests/test_guard.py`, `test_approval_rule_key_is_namespaced_stable_and_leak_free`).
+- The judge score is not part of the key. Two different scores inside the review band
+  produce the same key for the same proposal, so a score that moves between runs cannot
+  fragment a remembered answer
+  (`tests/test_guard.py`, `test_review_band_directive_carries_the_namespaced_rule_key`).
+- A proposal that cannot be serialized is blocked instead of being escalated under a
+  coarser key. The failure path is exercised directly, and invalid arguments are denied
+  before any request is sent
+  (`tests/test_guard.py`, `test_unidentifiable_proposal_denies_instead_of_approving`).
+- The real Hermes dispatcher passes the plugin's `rule_key` to the approval gate, and the
+  gate stores the remembered answer under `plugin_rule:one-guard:<digest>` rather than
+  under the bare tool name
+  (`tests/test_hermes_integration.py`, `test_approval_rule_key_is_namespaced_and_leak_free`).
+- A remembered answer covers one exact proposal. The same proposal is answered from the
+  remembered session answer, while a different proposal for the same tool is asked about
+  again instead of being silently approved
+  (`tests/test_hermes_integration.py`, `test_remembered_approval_covers_only_the_exact_proposal`).
+
+The two integration tests were checked against the previous behaviour: with the
+`rule_key` removed from the directive, both fail. The captured key was the bare tool
+name, which is the behaviour this change replaces.
+
+These are stub and dispatcher results. They establish the approval grain and its
+scope, not judge efficacy, and they do not change the host's own bypasses:
+`approvals.mode: off`, the YOLO toggle, unattended approve modes, and the allowlists
+remain host policy, and a mid-band call can still be approved without a human.
+
+## Installer review-band rule verification
+
+The installer's `--threshold` flag contradicted the documented rule. With an explicit block
+cutoff and no explicit approval cutoff, the installer let the approval cutoff follow the
+block cutoff, so `--threshold 0.6` wrote `approval_threshold: 0.6` and left the review band
+empty. The documented rule, in `docs/installation.md` and `AGENTS.md`, is that an explicit
+`--threshold` returns the review band to the default `approval_threshold` of `0.5` unless
+`--approval-threshold` is passed as well.
+
+The rule now lives in one place, `threshold_sources` in `scripts/install.py`. The installer
+merge and the wizard defaults both call it, and `resolve_thresholds` still reduces an
+approval cutoff above the block cutoff to the block cutoff, so the block cutoff always wins.
+The runtime resolution in `plugins/one-guard/guard.py` is unchanged: a configuration that
+holds a block cutoff without an approval cutoff still keeps its exact legacy two-band
+behaviour.
+
+Verified on 2026-10-29 against Hermes source at
+`e5f2b15300a3d04978e4c07cc64adc7bcf8e7b1c`, using CPython 3.11.10 on Linux. The full suite
+reported **227 tests passed, no skips, in 202.986 seconds**; a second clean run of the same
+tree reported 227 passed in 202.509 seconds. The run included no request to
+a live judge, no Hermes installation, and no model or inference service.
+
+What the tests establish:
+
+- A fresh install with `--threshold 0.6` writes `threshold: 0.6` and
+  `approval_threshold: 0.5`, so the review band is not silently emptied
+  (`tests/test_install.py`, `test_explicit_threshold_returns_the_review_band_to_the_default`).
+- An existing approval cutoff does not survive an explicit `--threshold` on its own: the
+  default `0.5` replaces it
+  (`tests/test_install.py`, `test_explicit_threshold_replaces_an_existing_approval_cutoff_with_the_default`).
+- Without a threshold flag an existing approval cutoff is kept exactly
+  (`tests/test_install.py`, `test_existing_approval_cutoff_is_kept_without_threshold_flags`).
+- A legacy configuration that holds only `threshold` keeps its exact two-band behaviour,
+  with the approval cutoff following the block cutoff and the review band empty
+  (`tests/test_install.py`, `test_legacy_threshold_keeps_its_exact_two_band_behaviour`).
+- An explicit `--threshold 0.3` is clamped by the block cutoff, so the approval cutoff
+  becomes `0.3` and the review band stays empty
+  (`tests/test_install.py`, `test_explicit_block_cutoff_below_the_default_approval_cutoff_is_clamped`).
+- An explicit `--approval-threshold` survives an explicit `--threshold`, and a cutoff above
+  the block cutoff is still reduced to it
+  (`tests/test_install.py`, `test_explicit_approval_cutoff_survives_an_explicit_threshold`,
+  `test_approval_cutoff_above_the_block_cutoff_is_reduced`).
+- The wizard uses the same rule: a seeded `--threshold 0.6` offers `0.5` as the approval
+  default and writes it, both on a fresh home and on a home that already held an approval
+  cutoff (`tests/test_installer_wizard.py`,
+  `test_wizard_seeded_threshold_returns_the_review_band_to_the_default`,
+  `test_wizard_seeded_threshold_replaces_an_existing_approval_cutoff`).
+- `--yes` prints the effective band, so a non-interactive run reports the band it wrote:
+  `Risk band: allow below 0.5, review 0.5 to 0.6, block at 0.6 and above`, and
+  `Risk band: not used in yes/no mode` in yes/no mode
+  (`tests/test_install.py`, `test_yes_reports_the_effective_review_band`,
+  `test_yes_reports_no_band_in_yes_no_mode`).
+
+These are installer results. They establish which cutoffs are written to `config.yaml` and
+what the installer reports, not judge efficacy or any host approval behaviour.
+
+## Final review pass: widening claim, peer precedence, evaluator defaults
+
+A final targeted review of the three-band work raised five findings. No guard, installer, or
+policy behaviour changed; only documentation, one test-harness fix, and three tests.
+
+**The widening claim.** The installer docstring, `docs/installation.md`, and ADR 0008
+described the cutoff rules with a single sentence that "no configuration can widen what is
+allowed". That sentence is true of the clamp only, where an approval cutoff above the block
+cutoff is reduced to the block cutoff. It was false for the `--threshold` reset: passing an
+explicit `--threshold` returns the approval cutoff to the default `0.5`, and an installation
+whose approval cutoff was below `0.5` then allows the scores between that cutoff and `0.5`
+instead of sending them to the review band. The reset is an operator-selected default, and
+the review screen shows the effective band before anything is written. The documentation now
+states both rules separately, and the CLI help distinguishes them: `--threshold` says the
+reset can allow what a lower approval cutoff would have reviewed, and `--approval-threshold`
+says a value above the block cutoff is reduced to the block cutoff rather than rejected.
+
+**Peer precedence.** The pinned Hermes revision scans `pre_tool_call` hooks in registration
+order, keeps the first valid `approve` directive, and lets any valid `block` veto win over an
+approval request (`hermes_cli/plugins.py:1907-1958`). One Guard's namespaced rule key is
+therefore the remembered grain only when no earlier plugin asks for approval first. Both
+cases are now covered by real dispatcher tests against the pinned source:
+
+- An earlier peer's `approve` directive owns the approval the host records. The gate is
+  called with the peer's message and rule key, the remembered session answer is stored under
+  `plugin_rule:peer-fixture:rule`, and the guard's own `plugin_rule:one-guard:<digest>` grain
+  is not approved
+  (`tests/test_hermes_integration.py`,
+  `test_peer_approve_registered_first_keeps_its_own_rule_key`).
+- A peer's `block` directive vetoes the guard's review-band request. The guard judged the
+  proposal and the host never reaches its approval gate, so the call does not execute
+  (`tests/test_hermes_integration.py`,
+  `test_peer_block_veto_overrides_the_guard_review_band`).
+
+The precedence test was checked against the opposite registration order: with the peer hook
+registered after the guard's, the guard's message wins and the test fails.
+
+**Evaluator defaults.** `scripts/eval-security.py` carries its own default cutoffs, so a
+test now pins them to the plugin defaults
+(`tests/test_security_eval.py`, `test_evaluator_defaults_match_the_plugin_defaults`).
+
+**Terminal harness.** `tests/test_installer_terminal.py` raised `installer parent did not
+exit` on the first `waitpid` attempt when the installer was still winding down, and its
+cleanup could block the suite forever on a child that never exited. `exit_code` now polls
+within a bounded deadline, and `close` waits, then signals the child if it is still running,
+so a regression fails the test instead of hanging the run.
+
+Verified on 2026-10-29 against Hermes source at
+`e5f2b15300a3d04978e4c07cc64adc7bcf8e7b1c`, using CPython 3.11.10 on Linux. The full suite
+reported **230 tests passed, no skips, in 206.408 seconds**; a second clean run of the same
+tree reported 230 passed in 206.312 seconds. The run included no request to a live judge, no
+Hermes installation, and no model or inference service.
+
+Commands:
+
+```sh
+HERMES_SOURCE=/path/to/hermes-source python3 -m unittest discover -s tests -p 'test_*.py'
+python3 -m compileall -q plugins/one-guard scripts tests
+sh -n scripts/verify-hermes.sh
+```
+
+These are dispatcher and installer results. They establish which directive Hermes honours
+and which cutoffs are written, not judge efficacy or any calibration claim.
+
+## Synthetic security evaluation
+
+`scripts/eval-security.py` ships with 100 original synthetic proposals in
+`tests/fixtures/security-cases.jsonl`, five risky and five benign in each of ten
+categories. The offline mode loads the corpus, applies the selection filters, and stops
+before the transport is loaded.
+
+Executed on 2026-10-29 with CPython 3.11.10 on Linux:
+
+```sh
+python3 scripts/eval-security.py
+{"status": "skipped", "cases": 100, "reason": "--run-live not specified"}
+python3 scripts/eval-security.py --category SEC03 --limit 4
+{"status": "skipped", "cases": 4, "reason": "--run-live not specified"}
+```
+
+The first run selected all 100 cases and made no request. The second applied the category
+filter before the limit and selected four cases, as documented. The evaluator tests
+exercise the production payload builder, the production response parser, the band
+arithmetic, and the metric denominators against a stubbed exchange, so they establish the
+request shape and the scoring rules rather than judge efficacy. The evaluator's cutoffs are
+configurable with `--approval-threshold` and `--block-threshold`, and an approval cutoff
+above the block cutoff is refused.
+
+No live judge was contacted for this pass and no live evaluation result is asserted. The
+labels in the corpus are expectations about the visible proposals, not ground truth.
+
+
+## Installer credential-resolution follow-up
+
+The discovery follow-up ran 184 tests: 171 passed and 13 Hermes integration
+tests were skipped because `HERMES_SOURCE` was unset. The discovery suite
+passed 58 tests, and a pseudo-terminal regression passed. These tests verify
+that unresolved credentials at the model step do not cause a network request
+or display the unresolved model default, while manual entry can repair an
+invalid existing model. Malformed environment files or read errors can also
+abort before that step. Network tests used local stubs, not a live judge.
+
 Verified on 2026-10-27 against Hermes source at
 `e5f2b15300a3d04978e4c07cc64adc7bcf8e7b1c`, using CPython 3.11.10 on Linux.
 The tests enforce this revision and check the imported upstream module paths.
@@ -61,6 +330,24 @@ instead explicitly skips integration tests when `HERMES_SOURCE` is unset.
 An invalid source directory, wrong commit, or missing import fails the tests.
 
 ## Recorded results
+
+The final review batch of 2026-10-29 ran the complete suite with the Hermes source
+available: **227 tests passed, no skips, in 202.986 seconds**, using CPython 3.11.10 on
+Linux against Hermes source at `e5f2b15300a3d04978e4c07cc64adc7bcf8e7b1c`; a second clean
+run of the same tree reported 227 passed in 202.509 seconds. The same pass
+ran `python3 -m compileall -q plugins/one-guard scripts tests`, `sh -n scripts/verify-hermes.sh`,
+`sh -n install.sh`, and `pip check` in the verification environment; all passed and `pip
+check` reported no broken requirements. The count includes the installer review-band rule
+tests, the wizard defaults, the configurable evaluator thresholds, and the synthetic
+evaluation suite. No request was made to a live judge, and no Hermes installation, model,
+or inference service was involved.
+
+One test in that file is timing-sensitive and fails intermittently: the pseudo-terminal
+handoff test asserts that the installer parent has exited within a fixed window after a
+`SIGHUP`, and the parent sometimes needs longer. It failed once in four full-suite runs of
+this batch and passed in the other three, and it also failed on its own when that file was
+run repeatedly. The assertion is raised in the installer handoff and signal path, before
+any configuration is merged, so it is not connected to the changes recorded here.
 
 Final driver verification after all implementation changes: **96 tests passed,
 no skips, in 64.204 seconds**. That total includes the Hermes runtime
@@ -141,6 +428,94 @@ smoke validation. Installer tests cover fractional flags, omitted-setting
 preservation, the unchanged default, and default/custom/unlimited host budgets
 without changing the global host setting. Smoke success uses only a loopback
 stub. No live probe or real installation was run in this follow-up.
+
+#### Installer discovery hardening
+
+A review pass over the opt-in model-discovery step produced installer-only
+changes, all exercised against loopback stubs. The executed checks:
+
+| Check | Outcome |
+| --- | --- |
+| Full suite, no Hermes source | 170 tests passed, 13 skipped, 150.545 seconds |
+| Installer discovery tests alone | 45 tests passed, 33.226 seconds |
+| Compile check | Exit 0 |
+
+The skipped tests are the Hermes runtime integration tests, which need a
+`HERMES_SOURCE` checkout and are unrelated to this pass.
+
+What the new tests actually prove, against a loopback HTTP stub or a loopback
+TLS stub on `127.0.0.1`:
+
+- A model identifier that contains the selected credential anywhere is never
+  offered, never written to `config.yaml`, and absent from the installer's
+  backup copies and printed output. A short credential suppresses every matching
+  identifier. A selection that carries the credential is refused before anything
+  is written, and a stored `judge_model` that contains the credential is not
+  offered again.
+- A deeply nested JSON response falls back to manual model entry; cancelling
+  after that fallback leaves the target home uncreated.
+- The consent screen names the credential selected by this installer, states
+  that Hermes may resolve a different credential at runtime, and warns that a
+  remote plaintext HTTP endpoint carries the credential unencrypted or exposes
+  the request. A literal loopback endpoint is not reported as remote.
+- Capability is reported as native decisions only when `decisions` is listed and
+  as text-only only when the list is exactly `text`; mixed, malformed, empty,
+  and unrelated values are unknown.
+- Identifiers holding Unicode control or format characters are dropped, and a
+  configured model holding one is refused.
+- The identifier limit counts usable identifiers; dropped entries do not make
+  the list report truncation, and an exhausted probe slot falls back without
+  naming any internal detail.
+- A self-signed TLS certificate is rejected, the default verifying context is
+  used with hostname checking and `CERT_REQUIRED`, and a trusted certificate is
+  accepted.
+
+No external host was contacted. The remote-endpoint cases use the documentation
+address `192.0.2.1` with a stubbed probe, and the credential is never sent
+there. These tests do not establish live model-list behavior, model
+compatibility, or classification efficacy.
+
+#### Installer discovery re-review pass
+
+A targeted re-review of the model-discovery step produced installer-only
+changes, all exercised against loopback stubs. The executed checks:
+
+| Check | Outcome |
+| --- | --- |
+| Full suite, no Hermes source | 180 tests passed, 13 skipped, 155.718 seconds |
+| Installer discovery tests alone | 55 tests passed, 38.263 seconds |
+| Compile check | Exit 0 |
+
+The skipped tests are the Hermes runtime integration tests, which need a
+`HERMES_SOURCE` checkout and are unrelated to this pass.
+
+What the added and changed tests actually prove, against a loopback HTTP stub or
+a loopback TLS stub on `127.0.0.1`:
+
+- Identifiers that carry the selected credential are dropped before the
+  identifier limit and the truncation flag are computed. Sixty-four
+  credential-bearing identifiers do not consume the limit, so the legitimate
+  identifiers that follow are still offered and the list does not report
+  truncation; a short credential behaves the same way. With more than 64
+  surviving identifiers the list is still truncated and still holds only
+  legitimate identifiers. The parser drops the credential before counting when
+  called directly, and the probe drops it end to end.
+- The credential never reaches the offered list, the printed output, the written
+  `config.yaml`, or the installer backups.
+- The `Host` header omits the default port for the scheme in use: `443` over
+  HTTPS and `80` over HTTP, while a non-default port stays in the header. The
+  loopback stub still receives a `Host` header naming its own host and port.
+- Capability metadata is matched exactly. Native decisions are reported only
+  when the exact value `decisions` is listed, and text-only output only for the
+  single-element list `["text"]`. Differently cased or padded values, a repeated
+  `text`, and a list holding a non-string value are all reported as unknown.
+
+The DNS behavior is documented, not tested here: name resolution is not
+cancellable, so a worker blocked in system DNS keeps its probe slot until the
+lookup returns, which can outlast the five-second caller deadline.
+
+No external host was contacted in this pass either, and nothing here changes
+the scope of the plugin or establishes live model-list behavior.
 
 Earlier native-protocol implementation results:
 
@@ -239,6 +614,15 @@ Covered verdicts and failures include:
 
 - Strict `yes` denies and strict `no` allows.
 - Probability 0 and 0.49 allow at threshold 0.5; 0.5 and 1 deny.
+- A score inside the review band returns an `approve` directive; the real Hermes gate
+  runs the tool when a human approves, and blocks it on denial, on timeout, and in a
+  context with nobody to answer. `approvals.mode: off` auto-approves the same call,
+  which is the host's policy rather than the plugin's decision.
+- That `approve` directive carries a namespaced `rule_key`, and the real Hermes gate
+  stores a remembered answer under `plugin_rule:one-guard:<digest>` rather than under
+  the bare tool name. The same proposal is answered from the remembered session answer;
+  a different proposal for the same tool is asked about again instead of being silently
+  approved.
 - NaN, boolean, wrong probability shape, malformed yes/no, unknown verdict,
   and duplicate verdict keys deny before tool execution.
 - A delayed judge response exceeds a 0.1-second timeout and denies.
@@ -450,6 +834,14 @@ compile checks, shell syntax, and dependency consistency.
 C1's accepted limitation is demonstrated above. The tests establish no binding
 between judged arguments and final dispatched arguments in the unsupported
 rewriting configuration. The plugin remains a normal public-API native hook.
+
+The approval rule key narrows what a remembered host answer covers. It does not
+make the gate stricter: `approvals.mode: off`, the YOLO toggle, unattended approve
+modes, and the session and permanent allowlists remain host policy, so a mid-band
+call can still be approved without a human. The recorded scope holds on a host
+that honours `rule_key`; a host that ignores it falls back to the bare tool name.
+The namespace describes One Guard's own approval only: when a peer plugin's approval
+takes precedence, the host remembers the peer's rule key instead.
 
 ## Venv package inventory
 

@@ -4,6 +4,7 @@ __pycache__/
 .env
 .pytest_cache/
 .test-artifacts/
+.playwright-mcp/
 dist/
 build/
 *.egg-info/

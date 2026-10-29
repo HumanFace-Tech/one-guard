@@ -80,6 +80,9 @@ class InstallTests(unittest.TestCase):
         self.home.mkdir(exist_ok=True)
         (self.home / "config.yaml").write_text(text)
 
+    def settings(self):
+        return yaml.safe_load((self.home / "config.yaml").read_text())["plugins"]["entries"]["one-guard"]["settings"]
+
     def test_timeout_flag_preservation_and_bounds(self):
         for value in ("121", "nan", "inf", "0"):
             code, output = self.run_install("--timeout", value)
@@ -137,6 +140,101 @@ class InstallTests(unittest.TestCase):
         self.assertNotIn("Warning:", output)
         settings = yaml.safe_load((self.home / "config.yaml").read_text())["plugins"]["entries"]["one-guard"]["settings"]
         self.assertNotIn("timeout", settings)
+
+    def test_new_install_writes_the_three_band_thresholds(self):
+        code, output = self.run_install("--response-mode", "probability")
+        self.assertEqual(code, 0, output)
+        settings = yaml.safe_load((self.home / "config.yaml").read_text())["plugins"]["entries"]["one-guard"]["settings"]
+        self.assertEqual(settings["threshold"], 0.7)
+        self.assertEqual(settings["approval_threshold"], 0.5)
+
+    def test_legacy_threshold_keeps_its_exact_two_band_behaviour(self):
+        self.config("plugins: {entries: {one-guard: {settings: {threshold: 0.3}}}}\n")
+        code, output = self.run_install()
+        self.assertEqual(code, 0, output)
+        settings = yaml.safe_load((self.home / "config.yaml").read_text())["plugins"]["entries"]["one-guard"]["settings"]
+        self.assertEqual(settings["threshold"], 0.3)
+        self.assertEqual(settings["approval_threshold"], 0.3)
+
+    def test_threshold_flags_are_written_and_validated(self):
+        code, output = self.run_install("--threshold", "0.8", "--approval-threshold", "0.6")
+        self.assertEqual(code, 0, output)
+        settings = yaml.safe_load((self.home / "config.yaml").read_text())["plugins"]["entries"]["one-guard"]["settings"]
+        self.assertEqual(settings["threshold"], 0.8)
+        self.assertEqual(settings["approval_threshold"], 0.6)
+        for flags in [("--threshold", "1.5"), ("--approval-threshold", "-0.1"),
+                      ("--approval-threshold", "nan")]:
+            with self.subTest(flags=flags):
+                self.assertEqual(self.run_install(*flags)[0], 1)
+
+    def test_approval_cutoff_above_the_block_cutoff_is_reduced(self):
+        code, output = self.run_install("--threshold", "0.4", "--approval-threshold", "0.9")
+        self.assertEqual(code, 0, output)
+        settings = yaml.safe_load((self.home / "config.yaml").read_text())["plugins"]["entries"]["one-guard"]["settings"]
+        self.assertEqual(settings["threshold"], 0.4)
+        self.assertEqual(settings["approval_threshold"], 0.4)
+
+    def test_explicit_threshold_returns_the_review_band_to_the_default(self):
+        code, output = self.run_install("--threshold", "0.6")
+        self.assertEqual(code, 0, output)
+        settings = self.settings()
+        self.assertEqual(settings["threshold"], 0.6)
+        self.assertEqual(settings["approval_threshold"], 0.5)
+
+    def test_explicit_threshold_replaces_an_existing_approval_cutoff_with_the_default(self):
+        self.config("plugins: {entries: {one-guard: {settings: "
+                    "{threshold: 0.7, approval_threshold: 0.4}}}}\n")
+        code, output = self.run_install("--threshold", "0.6")
+        self.assertEqual(code, 0, output)
+        settings = self.settings()
+        self.assertEqual(settings["threshold"], 0.6)
+        self.assertEqual(settings["approval_threshold"], 0.5)
+
+    def test_existing_approval_cutoff_is_kept_without_threshold_flags(self):
+        self.config("plugins: {entries: {one-guard: {settings: "
+                    "{threshold: 0.7, approval_threshold: 0.4}}}}\n")
+        code, output = self.run_install()
+        self.assertEqual(code, 0, output)
+        settings = self.settings()
+        self.assertEqual(settings["threshold"], 0.7)
+        self.assertEqual(settings["approval_threshold"], 0.4)
+
+    def test_explicit_block_cutoff_below_the_default_approval_cutoff_is_clamped(self):
+        code, output = self.run_install("--threshold", "0.3")
+        self.assertEqual(code, 0, output)
+        settings = self.settings()
+        self.assertEqual(settings["threshold"], 0.3)
+        self.assertEqual(settings["approval_threshold"], 0.3)
+
+    def test_explicit_approval_cutoff_survives_an_explicit_threshold(self):
+        code, output = self.run_install("--threshold", "0.8", "--approval-threshold", "0.6")
+        self.assertEqual(code, 0, output)
+        settings = self.settings()
+        self.assertEqual(settings["threshold"], 0.8)
+        self.assertEqual(settings["approval_threshold"], 0.6)
+
+    def test_yes_reports_the_effective_review_band(self):
+        code, output = self.run_install("--response-mode", "probability", "--threshold", "0.6")
+        self.assertEqual(code, 0, output)
+        self.assertIn("Risk band: allow below 0.5, review 0.5 to 0.6, block at 0.6 and above",
+                      output)
+
+    def test_yes_reports_no_band_in_yes_no_mode(self):
+        code, output = self.run_install()
+        self.assertEqual(code, 0, output)
+        self.assertIn("Risk band: not used in yes/no mode", output)
+
+    def test_installer_and_runtime_resolve_thresholds_identically(self):
+        plugin = importlib.util.spec_from_file_location(
+            "one_guard_guard", ROOT / "plugins/one-guard/guard.py")
+        runtime = importlib.util.module_from_spec(plugin)
+        sys.modules[plugin.name] = runtime
+        plugin.loader.exec_module(runtime)
+        for block in (None, 0, 0.3, 0.5, 0.7, 0.9, 1):
+            for approval in (None, 0, 0.25, 0.5, 0.7, 1):
+                with self.subTest(block=block, approval=approval):
+                    self.assertEqual(installer.resolve_thresholds(block, approval),
+                                     runtime.resolve_thresholds(block, approval))
 
     def test_install_preserves_config_and_secures_files(self):
         self.config("model: {name: existing}\nextra: [null, true, 2]\nplugins:\n  enabled: [other]\n  disabled: [one-guard, other-disabled]\n  entries:\n    other: {settings: {value: 9}}\n    one-guard:\n      settings: {threshold: 0.2}\n")
@@ -309,9 +407,9 @@ class InstallTests(unittest.TestCase):
 
     def test_interactive_cancellation_writes_nothing(self):
         output = io.StringIO()
-        with patch.object(installer.sys.stdin, "isatty", return_value=True), patch.object(output, "isatty", return_value=True), patch("builtins.input", side_effect=["", "1", "1", "", "", "1", "", "1", "3"]), contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
+        with patch.object(installer.sys.stdin, "isatty", return_value=True), patch.object(output, "isatty", return_value=True), patch("builtins.input", side_effect=["", "1", "1", "", "1", "", "1", "", "", "3"]), contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(installer.main(["--hermes-dir", str(self.source), "--plain"]), 1)
-        self.assertIn("06 / Review", output.getvalue())
+        self.assertIn("07 / Review", output.getvalue())
         self.assertFalse(self.home.exists())
 
     def test_missing_yaml_actionable_and_no_pip(self):

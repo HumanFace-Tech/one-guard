@@ -13,19 +13,66 @@ The installer enables the plugin at `plugins.enabled` and writes non-secret sett
 | `prompt` | `""` | Optional text appended to the built-in system prompt. It augments rather than replaces the default policy. |
 | `mode` | `yes_no` | Chat: exact JSON verdict or bare number. Native: binary `choice` for `yes_no`, `noul` for `probability`. See schemas below. |
 | `timeout` | `5.0` seconds | Finite number from `0.01` through `120.0`. One monotonic deadline covers serialization, capacity waiting, connection, headers, body, and verdict parsing. Hermes' separate host hook budget also applies. DNS caveat below. |
-| `threshold` | `0.5` | Finite number from `0.0` through `1.0`, used only in probability mode. A score equal to the threshold denies. |
+| `threshold` | `0.7` | Finite number from `0.0` through `1.0`, used only in probability mode. A score at or above the block cutoff is denied. |
+| `approval_threshold` | `0.5` | Finite number from `0.0` through `1.0`, used only in probability mode. A score at or above it, and below `threshold`, is sent to the Hermes approval gate. |
 | `allow_insecure_http` | `false` | Allows remote HTTP only when explicitly enabled. HTTPS and literal loopback IP HTTP are accepted by default. |
 
-Environment overrides are `ONE_GUARD_PROTOCOL`, `ONE_GUARD_ENDPOINT`, `ONE_GUARD_TOKEN`, `ONE_GUARD_MODEL`, `ONE_GUARD_PROMPT`, `ONE_GUARD_MODE`, `ONE_GUARD_TIMEOUT`, `ONE_GUARD_THRESHOLD`, and `ONE_GUARD_ALLOW_INSECURE_HTTP`. For example:
+Environment overrides are `ONE_GUARD_PROTOCOL`, `ONE_GUARD_ENDPOINT`, `ONE_GUARD_TOKEN`, `ONE_GUARD_MODEL`, `ONE_GUARD_PROMPT`, `ONE_GUARD_MODE`, `ONE_GUARD_TIMEOUT`, `ONE_GUARD_THRESHOLD`, `ONE_GUARD_APPROVAL_THRESHOLD`, and `ONE_GUARD_ALLOW_INSECURE_HTTP`. For example:
 
 ```sh
 ONE_GUARD_TOKEN='your-token' \
-ONE_GUARD_THRESHOLD=0.4 \
+ONE_GUARD_THRESHOLD=0.7 \
+ONE_GUARD_APPROVAL_THRESHOLD=0.5 \
 ONE_GUARD_ALLOW_INSECURE_HTTP=false \
 hermes
 ```
 
 `localhost` is a hostname, not a literal loopback IP, so `http://localhost:...` is rejected unless `allow_insecure_http` is true. Prefer a literal loopback address or HTTPS. Remote HTTP sends tool arguments without transport encryption and should be avoided.
+
+## Probability bands
+
+In probability mode the score selects one of three bands:
+
+| Score | Result |
+| --- | --- |
+| `score < approval_threshold` | the call runs |
+| `approval_threshold <= score < threshold` | the call is sent to the Hermes approval gate, subject to host policy |
+| `score >= threshold` | the call is blocked |
+
+The edges are exact: a score equal to `approval_threshold` is inside the review band, and a score equal to `threshold` is blocked. With the defaults, `0.49` runs, `0.5` and `0.69` need approval, and `0.7` and above are blocked.
+
+Yes/no mode has no review band. `no` runs the call and `yes` blocks it, exactly as before.
+
+Anything that is not an explicit safe judgment blocks: malformed responses, duplicate JSON keys, refusals, tool calls in the answer, transport failures, timeouts, an unreachable judge, and an invalid configuration.
+
+### Threshold migration
+
+`threshold` used to be the only cutoff and meant "block at or above". It still means that, but its default moved from `0.5` to `0.7` and a second cutoff was added. The plugin resolves both cutoffs the same way the installer does:
+
+- A configured `threshold` without a configured `approval_threshold` keeps the old behaviour exactly. The approval cutoff follows the block cutoff, the review band stays empty, and a legacy `threshold: 0.3` still blocks every score of `0.3` and above. This holds for every legacy value, including values above `0.5`.
+- An `approval_threshold` above `threshold` is reduced to `threshold`. The block cutoff always wins, so that clamp never widens what is allowed and never makes the configuration invalid.
+- With neither cutoff configured, the defaults apply: run below `0.5`, review from `0.5` to `0.7`, block at `0.7` and above.
+
+To opt a legacy installation into the review band, set `approval_threshold` explicitly, for example `approval_threshold: 0.5` with `threshold: 0.7`. The installer writes both keys, so re-running it materializes the current behaviour in `config.yaml` and shows the effective band on its review screen.
+
+The installer adds one rule on top of this resolution: passing `--threshold` without `--approval-threshold` returns the approval cutoff to the default `0.5`. That reset can widen what an installation allows, because a configured approval cutoff below `0.5` no longer applies to the scores between it and `0.5`. It happens only when the operator asks for it, and the review screen shows the effective band before the write.
+
+### The review band and the Hermes approval gate
+
+A score inside the review band makes the plugin return `{"action": "approve", "message": ...}` from the `pre_tool_call` hook. Hermes then runs its own human approval gate for that tool call, the same gate it uses for dangerous shell patterns. The message states the score and the band; it carries no tool arguments, no credentials, and no judge secrets.
+
+The host owns that gate, so the operator's own host policy decides what happens:
+
+- A human who approves lets the call run. A human who denies blocks it, and so does a timeout or a cancelled prompt.
+- An unattended context with nobody to answer blocks the call. Hermes fails closed there.
+- `approvals.mode: off`, the YOLO toggle, unattended approve modes such as `approvals.single_query_mode: approve`, and the session or permanent allowlists can approve the call without a human. One Guard cannot override host approval policy from a plugin callback.
+- The plugin sets its own `rule_key`: a namespaced `one-guard:<sha256>` digest over the full validated bounded tool name and arguments. A `session` or `always` answer therefore applies to that exact proposal, not to every later review-band call for the same tool. The digest carries no raw argument, no credential, and no judge score, and a proposal that cannot be serialized is blocked instead of being escalated under a coarser key. A plugin that returns no `rule_key` is keyed by the bare tool name instead, which also covers approvals other plugins request for the same tool.
+
+The review band needs a host that understands the `approve` directive. The pinned Hermes revision does; a host that ignores it would run a mid-band call without a human.
+
+The digest identifies the proposal as judged. A peer `pre_tool_call` hook that rewrites the arguments after One Guard judged them is an unsupported configuration, so a remembered answer follows the judged proposal and not a rewritten one. See [ADR 0005](adr/0005-accept-hook-visible-proposal-boundary.md).
+
+The digest also scopes an answer only while One Guard's own approval is the one the host keeps. Hermes keeps the first valid `approve` directive of a call, so a peer plugin that asks for approval before One Guard does takes precedence: the host remembers the peer's rule key, and the digest no longer describes what the answer covers. A peer's `block` directive vetoes the call either way. See [ADR 0009](adr/0009-namespaced-approval-rule-key.md).
 
 ## Judge request and response
 
@@ -68,7 +115,7 @@ The OpenAI-compatible response must have a single `choices` entry, a `stop` fini
 {"verdict":"no"}
 ```
 
-In `yes_no` mode the only accepted object is `{"verdict":"yes"}` or `{"verdict":"no"}` with no extra keys. `no` allows and `yes` denies. In `probability` mode the content must be a bare finite JSON number from 0 to 1. A value below the configured threshold allows; equality or greater denies. Boolean values, quoted numbers, NaN, and extra response fields are invalid.
+In `yes_no` mode the only accepted object is `{"verdict":"yes"}` or `{"verdict":"no"}` with no extra keys. `no` allows and `yes` denies. In `probability` mode the content must be a bare finite JSON number from 0 to 1. The number is the risk score that selects one of the three probability bands. Boolean values, quoted numbers, NaN, and extra response fields are invalid.
 
 ### Native System One
 
@@ -94,7 +141,7 @@ The parser requires exactly `model` (nonempty string), `answers` (only `risk`), 
 {"type":"noul","noul":0.123}
 ```
 
-Noul is p(risk=true). Only a finite number in `[0,1]` strictly below `threshold` allows; equality denies. `yes_no` instead sends `type: choice` with criteria `{"yes":"Risk/unsafe/exfiltration","no":"Safe/no exfiltration"}`. The question object sent in the request is:
+Noul is p(risk=true). Only a finite number in `[0,1]` is accepted, and it selects the same three bands as the chat mode: below `approval_threshold` allows, the band up to `threshold` asks for approval, and `threshold` itself denies. `yes_no` instead sends `type: choice` with criteria `{"yes":"Risk/unsafe/exfiltration","no":"Safe/no exfiltration"}`. The question object sent in the request is:
 
 ```json
 {
@@ -110,7 +157,7 @@ And the required answer is exactly:
 {"type":"choice","choice":"no","probabilities":{"yes":0.1,"no":0.9},"confidence":0.8}
 ```
 
-Choice must be `yes` or `no`, both named probabilities and confidence must be finite numbers in `[0,1]`, probabilities must sum to 1 within absolute tolerance `1e-6`, and choice must agree with their maximum. Ties deny. `no` allows only when strictly more likely than `yes`; `yes` denies. The configured threshold applies only to probability/Noul mode. Missing or extra fields, extra questions, wrong answer types, booleans, NaN, conflicting probabilities, duplicate JSON keys, and chat envelopes on the native path deny. There is no retry with another protocol.
+Choice must be `yes` or `no`, both named probabilities and confidence must be finite numbers in `[0,1]`, probabilities must sum to 1 within absolute tolerance `1e-6`, and choice must agree with their maximum. Ties deny. `no` allows only when strictly more likely than `yes`; `yes` denies. The configured cutoffs apply only to probability/Noul mode. Missing or extra fields, extra questions, wrong answer types, booleans, NaN, conflicting probabilities, duplicate JSON keys, and chat envelopes on the native path deny. There is no retry with another protocol.
 
 Noul is a native typed probability, unlike the generic chat mode's model-generated JSON estimate. Upstream explicitly does not guarantee calibration for your data; One Guard establishes neither calibration nor real-world detection quality. Upstream also notes model-side input limits. For example, h2o-lightning keeps the first and last 16000 tokens for states exceeding 32000 tokens. One Guard sends full bounded arguments without local truncation, but cannot guarantee that a server processes every token.
 
@@ -119,3 +166,5 @@ Noul is a native typed probability, unlike the generic chat mode's model-generat
 Past live smoke tests contacted a private LAN judge service. Initial six-case requests timed out at 10 seconds each; later runs used a 60-second deadline and passed all six synthetic cases in both Noul probability and binary yes/no modes. Individual requests took 19.479 to 21.831 seconds. The smoke establishes those twelve observed outcomes only; it is not a security benchmark, calibration study, proof of prompt-injection resistance, or broad classification evaluation. The address is intentionally omitted. The example endpoint above is fictional and was not used for those tests. The default remains 5 seconds; explicit timeouts support up to 120 seconds. See [verification notes](verification.md#live-endpoint-observations).
 
 A separate trace-derived run on 2026-10-27 sent 12 inert proposals to the user-supplied private LAN judge using `h2o-lightning-4b`, threshold `0.5`, a 120-second timeout, and two workers. It matched 11 of 12 subjective expected labels. The judge allowed the `guard-removal` proposal (score `0.2594485504`), which was the one miss. This single run does not establish calibration or general detection efficacy. The incident command and three fragments came from one published trace; other cases were synthetic adaptations, not independent traces. See the [full results and limitations](verification.md#trace-derived-live-run-2026-10-27).
+
+Those runs predate the three-band policy and used the single threshold `0.5`, so every score was either allowed or denied. Under the current defaults the same scores are read differently: `0.2594485504` is still allowed, and a score of `0.5` would now ask for approval instead of being denied. The recorded observations were not re-run against the live judge, because the guard does not contact it from its own tests.

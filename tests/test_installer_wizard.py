@@ -22,6 +22,7 @@ class ScriptedUI:
                       for label, values in (texts or {}).items()}
         self.asked = []
         self.said = []
+        self.defaults = {}
 
     def clean(self, value):
         text = str(value)
@@ -51,6 +52,7 @@ class ScriptedUI:
 
     def text(self, label, default="", validate=str, secret=False, allow_empty=False):
         self.asked.append(("text", label))
+        self.defaults[label] = default
         queue = self.texts.get(label)
         if queue:
             value = queue.pop(0) if len(queue) > 1 else queue[0]
@@ -99,7 +101,7 @@ class WizardTests(unittest.TestCase):
         return yaml.safe_load((self.home / "config.yaml").read_text())["plugins"]["entries"]["one-guard"]["settings"]
 
     def test_full_wizard_installs_with_defaults(self):
-        ui = ScriptedUI(choices=["chat_completions", False, "yes_no", "keep", "install"])
+        ui = ScriptedUI(choices=["chat_completions", False, "yes_no", "keep", False, "install"])
         code, said = self.run_wizard(ui)
         self.assertEqual(code, 0, said)
         self.assertTrue((self.home / "plugins/one-guard/__init__.py").is_file())
@@ -110,11 +112,12 @@ class WizardTests(unittest.TestCase):
         self.assertEqual(settings["timeout"], 5)
 
     def test_wizard_systemone_lan_endpoint_is_accepted(self):
-        ui = ScriptedUI(choices=["systemone", True, "probability", "keep", "install"],
+        ui = ScriptedUI(choices=["systemone", True, "probability", "keep", False, "install"],
                         texts={"Judge endpoint": "http://192.0.2.1:9292/v1/systemone",
                                "Judge model": "h2o-lightning-4b",
                                "Timeout in seconds": "60",
-                               "Risk threshold": "0.5"})
+                               "Approval threshold (review band starts here)": "0.5",
+                               "Block threshold (blocked at or above)": "0.7"})
         code, said = self.run_wizard(ui)
         self.assertEqual(code, 0, said)
         settings = self.settings()
@@ -123,29 +126,78 @@ class WizardTests(unittest.TestCase):
         self.assertEqual(settings["judge_model"], "h2o-lightning-4b")
         self.assertEqual(settings["timeout"], 60)
         self.assertTrue(settings["allow_insecure_http"])
+        self.assertEqual(settings["approval_threshold"], 0.5)
+        self.assertEqual(settings["threshold"], 0.7)
+
+    def test_wizard_probability_band_is_collected_and_reviewed(self):
+        ui = ScriptedUI(choices=["chat_completions", False, "probability", "keep", False, "install"],
+                        texts={"Approval threshold (review band starts here)": "0.4",
+                               "Block threshold (blocked at or above)": "0.8"})
+        code, said = self.run_wizard(ui)
+        self.assertEqual(code, 0, said)
+        settings = self.settings()
+        self.assertEqual(settings["approval_threshold"], 0.4)
+        self.assertEqual(settings["threshold"], 0.8)
+        self.assertIn("Risk band", said)
+        self.assertIn("0.4", said)
+        self.assertIn("0.8", said)
+
+    def test_wizard_block_cutoff_below_the_approval_cutoff_is_reduced_not_widened(self):
+        ui = ScriptedUI(choices=["chat_completions", False, "probability", "keep", False, "install"],
+                        texts={"Approval threshold (review band starts here)": "0.6",
+                               "Block threshold (blocked at or above)": "0.3"})
+        code, said = self.run_wizard(ui)
+        self.assertEqual(code, 0, said)
+        settings = self.settings()
+        self.assertEqual(settings["threshold"], 0.3)
+        self.assertEqual(settings["approval_threshold"], 0.3)
+
+    def test_wizard_seeded_threshold_returns_the_review_band_to_the_default(self):
+        ui = ScriptedUI(choices=["chat_completions", False, "probability", "keep", False, "install"])
+        code, said = self.run_wizard(ui, extra=("--threshold", "0.6"))
+        self.assertEqual(code, 0, said)
+        settings = self.settings()
+        self.assertEqual(settings["threshold"], 0.6)
+        self.assertEqual(settings["approval_threshold"], 0.5)
+        self.assertEqual(ui.defaults["Approval threshold (review band starts here)"], 0.5)
+        self.assertEqual(ui.defaults["Block threshold (blocked at or above)"], 0.6)
+
+    def test_wizard_seeded_threshold_replaces_an_existing_approval_cutoff(self):
+        self.home.mkdir(parents=True)
+        (self.home / "config.yaml").write_text(
+            "plugins: {entries: {one-guard: {settings: "
+            "{threshold: 0.7, approval_threshold: 0.4}}}}\n")
+        ui = ScriptedUI(choices=["chat_completions", False, "probability", "keep", False, "install"])
+        code, said = self.run_wizard(ui, extra=("--threshold", "0.6"))
+        self.assertEqual(code, 0, said)
+        settings = self.settings()
+        self.assertEqual(settings["threshold"], 0.6)
+        self.assertEqual(settings["approval_threshold"], 0.5)
+        self.assertEqual(ui.defaults["Approval threshold (review band starts here)"], 0.5)
 
     def test_wizard_cancel_writes_nothing(self):
-        ui = ScriptedUI(choices=["chat_completions", False, "yes_no", "keep", "cancel"])
+        ui = ScriptedUI(choices=["chat_completions", False, "yes_no", "keep", False, "cancel"])
         code, said = self.run_wizard(ui)
         self.assertEqual(code, 1, said)
         self.assertFalse(self.home.exists())
 
     def test_wizard_edit_then_install(self):
-        ui = ScriptedUI(choices=["chat_completions", False, "yes_no", "keep", "edit", "judge",
-                                 "systemone", False, "probability", "install"],
+        ui = ScriptedUI(choices=["chat_completions", False, "yes_no", "keep", False, "edit", "judge",
+                                 "systemone", False, "probability", False, "install"],
                         texts={"Judge endpoint": ["http://127.0.0.1:8080/v1/chat/completions",
                                                  "http://127.0.0.1:8080/v1/systemone"],
                                "Judge model": "m",
                                "Timeout in seconds": "10",
-                               "Risk threshold": "0.25"})
+                               "Block threshold (blocked at or above)": "0.25"})
         code, said = self.run_wizard(ui)
         self.assertEqual(code, 0, said)
         settings = self.settings()
         self.assertEqual(settings["protocol"], "systemone")
         self.assertEqual(settings["threshold"], 0.25)
+        self.assertEqual(settings["approval_threshold"], 0.25)
 
     def test_invalid_endpoint_is_rejected_before_install(self):
-        ui = ScriptedUI(choices=["chat_completions", False, "yes_no", "keep", "install"],
+        ui = ScriptedUI(choices=["chat_completions", False, "yes_no", "keep", False, "install"],
                         texts={"Judge endpoint": "http://evil.test/v1/wrong"})
         with patch.object(installer.Path, "mkdir") as mkdir, patch.object(installer, "apply_install") as apply:
             code, said = self.run_wizard(ui)
@@ -158,7 +210,7 @@ class WizardTests(unittest.TestCase):
         relative_home = f"wizard-relative-home-{self.root.name}"
         workspace_target = ROOT / relative_home
         self.assertFalse(workspace_target.exists())
-        ui = ScriptedUI(choices=["chat_completions", False, "yes_no", "keep", "install"],
+        ui = ScriptedUI(choices=["chat_completions", False, "yes_no", "keep", False, "install"],
                         texts={"Hermes data home": relative_home})
         code, said = self.run_wizard(ui)
         self.assertEqual(code, 0, said)
@@ -166,7 +218,7 @@ class WizardTests(unittest.TestCase):
         self.assertFalse(workspace_target.exists())
 
     def test_credential_is_masked_in_review_and_never_written_to_yaml(self):
-        ui = ScriptedUI(choices=["chat_completions", False, "yes_no", "replace", "install"],
+        ui = ScriptedUI(choices=["chat_completions", False, "yes_no", "replace", False, "install"],
                         texts={"New bearer credential  (blank removes it)": "test-credential"})
         code, said = self.run_wizard(ui)
         self.assertEqual(code, 0, said)
@@ -236,7 +288,7 @@ class WizardTests(unittest.TestCase):
 
     def test_untrusted_values_cannot_emit_terminal_escapes(self):
         hostile = "\x1b[2J\x1b[31mPWNED\x07"
-        ui = ScriptedUI(choices=["chat_completions", False, "yes_no", "keep", "install"],
+        ui = ScriptedUI(choices=["chat_completions", False, "yes_no", "keep", False, "install"],
                         texts={"Judge model": hostile})
         code, said = self.run_wizard(ui)
         self.assertEqual(code, 1)
@@ -261,7 +313,7 @@ class WizardTests(unittest.TestCase):
                 return ScriptedUI.text(self, label, default, validate, secret, allow_empty)
 
         secret_value = "TOP-SECRET-TOKEN-XYZ"
-        ui = SecretUI(choices=["chat_completions", False, "yes_no", "replace", "install"])
+        ui = SecretUI(choices=["chat_completions", False, "yes_no", "replace", False, "install"])
         code, said = self.run_wizard(ui)
         self.assertEqual(code, 0, said)
         self.assertNotIn(secret, said)
@@ -312,7 +364,7 @@ class WizardTests(unittest.TestCase):
     def test_clearing_the_credential_removes_it_from_the_env_file(self):
         self.home.mkdir(parents=True, exist_ok=True)
         (self.home / ".env").write_text('OTHER="keep"\nONE_GUARD_TOKEN="old-secret"\n')
-        ui = ScriptedUI(choices=["chat_completions", False, "yes_no", "clear", "install"])
+        ui = ScriptedUI(choices=["chat_completions", False, "yes_no", "clear", False, "install"])
         code, said = self.run_wizard(ui)
         self.assertEqual(code, 0, said)
         from dotenv import dotenv_values
