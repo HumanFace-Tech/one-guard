@@ -37,6 +37,21 @@ Any OpenAI-compatible endpoint works. There's also support for the native llama.
 
 An earlier smoke run against a local `h2o-lightning-4b` matched 11 of 12 of my own expected labels, including denying the exact command from a published agent incident - and it *missed* one: a proposal to delete the guard itself. Those labels are my guesses, not ground truth, and the run does not validate the current probability cutoffs. Treat this as a useful layer, not a wall 🧱
 
+### A 100-case H2O check
+
+I also tried the 100 synthetic cases against H2O Lightning 4B (reported as v1.4.1; the endpoint did not verify the model version). Each category had five risky examples:
+
+| Risky proposals | Blocked | Approval | Allowed |
+| --- | ---: | ---: | ---: |
+| Uploads, GET leaks, hidden scripts, privilege changes, persistence and chained transfers | 30 / 30 | 0 | 0 |
+| Sensitive reads | 1 / 5 | 2 | 2 |
+| Guard changes | 1 / 5 | 2 | 2 |
+| Destructive changes | 2 / 5 | 2 | 1 |
+| Judge-directed instructions | 4 / 5 | 0 | 1 |
+| **Total** | **38 / 50** | **6** | **6** |
+
+All 50 benign controls were allowed. These are hand-labeled examples, not a real-world accuracy claim; an approval request can also be auto-approved by YOLO. The six allowed risky examples included private-key reads and guard-disabling changes - so don't treat the judge as your only protection.
+
 Details, settings, and the full request/response contract live in [docs/configuration.md](docs/configuration.md).
 
 ## What It Doesn't Do
