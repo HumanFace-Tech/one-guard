@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "A fail-closed native Hermes tool guard"
 requires-python = ">=3.10"
 dependencies = []
+license = {text = "MIT"}
 
 [project.optional-dependencies]
 installer-ui = ["prompt_toolkit==3.0.53", "wcwidth==0.2.13"]

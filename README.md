@@ -143,4 +143,4 @@ The suite covers the plugin runtime, the Hermes runtime integration, the install
 
 ## License
 
-Not set yet - I'll add one before calling this properly open source. Shout if you want a specific one.
+[MIT](LICENSE) 🎉 Use it, fork it, ship it. No warranty - a model that judges security is still a model, so keep your own safeguards in place.
